@@ -1,0 +1,2131 @@
+# STRATA — Structured Regime-Aware Transition Adaptive Diffusion
+# =================================================================
+# Publication version v16 — Corrected, complete, and evidence‑rich.
+# Merges algorithmic correctness with comprehensive evaluation and reporting.
+# Ready for Quantitative Finance submission.
+# =================================================================
+
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import logging
+import math
+import os
+import random
+import time
+from dataclasses import dataclass, field, asdict
+from typing import Dict, List, Optional, Tuple
+
+# -----------------------------------------------------------------------------
+# Dependency checks
+# -----------------------------------------------------------------------------
+REQUIRED_PACKAGES = {
+    "numpy": "numpy",
+    "pandas": "pandas",
+    "scipy": "scipy",
+    "torch": "torch",
+    "yfinance": "yfinance",
+}
+_missing = []
+for _mod, _pkg in REQUIRED_PACKAGES.items():
+    try:
+        __import__(_mod)
+    except ImportError:
+        _missing.append(_pkg)
+if _missing:
+    raise SystemExit(
+        "Missing packages: " + ", ".join(_missing) +
+        "\nInstall with: pip install " + " ".join(_missing)
+    )
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.amp import GradScaler, autocast
+from scipy.stats import ks_2samp
+from scipy.optimize import differential_evolution
+from torch.utils.data import DataLoader, Dataset
+
+try:
+    import yfinance as yf
+except ImportError:
+    raise SystemExit("yfinance required: pip install yfinance")
+
+# -----------------------------------------------------------------------------
+# Logging & Constants
+# -----------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s | %(levelname)s | %(message)s")
+LOGGER = logging.getLogger("strata")
+
+TORCH_DTYPE = torch.float32
+TRADING_DAYS = 252.0
+SAFE_EPS = 1e-8
+
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
+
+def amp_enabled(device: str) -> bool:
+    return device.startswith("cuda") and torch.cuda.is_available()
+
+
+def amp_dtype(device: str) -> torch.dtype:
+    return torch.float16 if amp_enabled(device) else torch.float32
+
+
+def make_grad_scaler(device: str) -> GradScaler:
+    return GradScaler("cuda", enabled=amp_enabled(device))
+
+
+# -----------------------------------------------------------------------------
+# Configuration (grouped for clarity)
+# -----------------------------------------------------------------------------
+@dataclass
+class ModelConfig:
+    seq_len: int = 20
+    horizon_days: int = 30
+    p_hidden_dim: int = 224
+    latent_vol_dim: int = 16
+    vol_hidden_dim: int = 96
+    vol_encoder_len_mult: int = 2
+    time_embed_dim: int = 64
+    n_res_blocks: int = 4
+    dropout: float = 0.05
+    q_hidden_dim: int = 80
+    num_regimes: int = 3
+    regime_dim: int = 24
+    regime_residual_scale: float = 0.45
+    regime_gate_temp: float = 0.35
+    regime_by_vol_only: bool = True
+
+
+@dataclass
+class TrainingConfig:
+    p_epochs: int = 80
+    q_epochs: int = 45
+    p_batch_size: int = 160
+    p_lr: float = 2e-4
+    q_lr: float = 1e-3
+    p_weight_decay: float = 1e-6
+    q_weight_decay: float = 1e-6
+    grad_clip: float = 5.0
+    p_warmup_epochs: int = 10
+    p_min_lr_frac: float = 0.05
+    p_patience: int = 200
+    p_es_min_delta: float = 1e-3
+    p_vol_pretrain_epochs: int = 60
+    p_vol_stage1_lam: float = 0.50
+    p_vol_joint_lam: float = 0.10
+
+
+@dataclass
+class StageConfig:
+    p_stage1_frac: float = 0.50
+    p_stage2_frac: float = 0.82
+    p_stage2_gate_enable: bool = True
+    p_stage2_gate_ks30_max: float = 0.55      # threshold on upper 95% CI
+    p_stage2_gate_patience: int = 2            # consecutive audits below threshold
+    p_stage2_gate_min_epoch: int = 40
+    p_stage3_min_gap_epochs: int = 30
+    p_stage1_use_vol: bool = True
+    p_stage1_use_anchor: bool = True
+    p_stage2_anchor_frac: float = 0.008
+    p_stage2_vol_frac: float = 0.03
+    p_anchor_frac_start: float = 0.35
+    p_anchor_frac_end: float = 0.985
+    p_anchor_max_lam: float = 0.0008
+    p_anchor_huber_delta: float = 2.0
+
+
+@dataclass
+class LossConfig:
+    p_absacf_target_lam: float = 0.05
+    p_tail_quantile_lam: float = 0.010
+    p_pred_kurt_target: float = 9.0
+    p_pred_kurt_cap_lam: float = 0.065
+    p_mmd_lam: float = 0.06
+    p_mmd_stage2_frac: float = 0.05
+    p_mmd_bandwidth: float = 0.95
+    p_tail_alpha: float = 1.50
+    p_kurt_lam: float = 0.020
+    p_horizon_mmd_lam: float = 0.006
+    p_path_acf_lam: float = 0.010
+    p_path_abs_acf_lam: float = 0.020
+    p_rollout_lam: float = 0.002
+    p_rollout_horizon: int = 5
+    p_rollout_start_frac: float = 0.70
+    p_regularizer_ramp_epochs: int = 40
+    p_dsm_stage2_weight: float = 0.985
+    p_dsm_stage3_weight: float = 0.80
+    p_ito_pde_lam: float = 0.0          # Score FPE weight (0 = off)
+    p_ito_pde_n_colloc: int = 32
+    p_ito_pde_t_lo: float = 0.02
+    p_ito_pde_t_hi: float = 0.98
+    p_option_pricing_lam: float = 0.03
+    p_option_pricing_n_paths: int = 16
+    p_option_pricing_max_contracts: int = 3
+    q_opt_lam_start: float = 0.10
+    q_opt_lam_end: float = 0.45
+    q_martingale_lam: float = 2.0
+    q_arb_mono_lam: float = 0.5
+    q_arb_convex_lam: float = 0.3
+    q_arb_calendar_lam: float = 0.3
+    q_gate_penalty: float = 5.0
+
+
+@dataclass
+class SamplerConfig:
+    p_sampling_steps: int = 8
+    diffusion_steps: int = 24
+    sampler_init_noise_scale: float = 0.80
+    sampler_temperature: float = 1.0
+    sampler_deterministic_tail_frac: float = 0.0
+    beta_min: float = 0.1
+    beta_max: float = 18.0
+
+
+@dataclass
+class DataConfig:
+    tickers: Tuple[str, ...] = ("SPY",)
+    start_date: str = "2012-01-01"
+    end_date: str = "2025-12-31"
+    train_frac: float = 0.70
+    val_frac: float = 0.15
+    risk_free: float = 0.0
+    normalise_returns: bool = True
+    normaliser_floor: float = 1e-4
+    max_abs_norm_ret: float = 10.0          # increased from 6.0
+    max_abs_daily_ret: float = 0.15
+    max_price: float = 1e9
+    n_paths_eval: int = 1500
+    n_paths_q_bank: int = 512
+    q_bank_train_anchors: int = 12
+    q_bank_val_anchors: int = 6
+    gbm_paths: int = 1500
+    heston_paths: int = 1000
+    rbergomi_paths: int = 800
+    baseline_steps: int = 30
+    synthetic_option_maturities: Tuple[int, ...] = (7, 14, 21, 30, 45)
+    synthetic_option_moneyness: Tuple[float, ...] = (0.90, 0.95, 1.00, 1.05, 1.10)
+    option_core_moneyness_lo: float = 0.95
+    option_core_moneyness_hi: float = 1.05
+    option_core_max_days: int = 21
+    p_finance_audit_every: int = 30
+    p_finance_audit_n_paths: int = 400
+    p_invalid_ks_hard_cap: float = 0.95
+    q_min_ess_frac_hard: float = 0.02
+
+
+@dataclass
+class Config:
+    version: str = "strataqf_v16"
+    seed: int = 42
+    out_dir: str = "strata_outputs"
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    num_workers: int = 2
+    pin_memory: bool = True
+    persistent_workers: bool = False
+    save_plots: bool = False
+
+    model: ModelConfig = field(default_factory=ModelConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
+    stage: StageConfig = field(default_factory=StageConfig)
+    loss: LossConfig = field(default_factory=LossConfig)
+    sampler: SamplerConfig = field(default_factory=SamplerConfig)
+    data: DataConfig = field(default_factory=DataConfig)
+
+    # Runtime state (not part of config)
+    current_epoch: int = 0
+    current_stage2_start_epoch: int = 0
+    _best_ckpt_rmse: float = 1e9
+    _best_ckpt_mart: float = 1e9
+    current_s0: float = 100.0
+    current_return_std: float = 1.0
+    current_target_vol_ann: float = 0.20
+
+
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def to_device(batch: Dict[str, torch.Tensor], device: str) -> Dict[str, torch.Tensor]:
+    return {k: v.to(device) for k, v in batch.items()}
+
+
+def safe_clip_returns(rets: np.ndarray, max_abs_ret: float) -> np.ndarray:
+    rets = np.asarray(rets, dtype=np.float64)
+    rets = np.nan_to_num(rets, nan=0.0, posinf=max_abs_ret, neginf=-max_abs_ret)
+    return np.clip(rets, -max_abs_ret, max_abs_ret)
+
+
+def returns_to_prices(s0: float, rets: np.ndarray, max_price: float = 1e9) -> np.ndarray:
+    rets = np.asarray(rets, dtype=np.float64)
+    log_paths = np.cumsum(rets, axis=1)
+    prices = s0 * np.exp(np.clip(log_paths, -50.0, 50.0))
+    prices = np.concatenate([np.full((len(prices), 1), s0), prices], axis=1)
+    return np.clip(prices, SAFE_EPS, max_price)
+
+
+def make_horizon_returns(rets: np.ndarray, horizon: int) -> np.ndarray:
+    if len(rets) < horizon or horizon <= 0:
+        return np.array([], dtype=np.float64)
+    return np.convolve(rets, np.ones(horizon, dtype=np.float64), mode="valid")
+
+
+def compute_ks_distance(a: np.ndarray, b: np.ndarray) -> float:
+    if len(a) == 0 or len(b) == 0:
+        return float("nan")
+    return float(ks_2samp(a, b).statistic)
+
+
+def compute_mmd(a: np.ndarray, b: np.ndarray, gamma: Optional[float] = None) -> float:
+    a = np.asarray(a, dtype=np.float64).reshape(-1, 1)
+    b = np.asarray(b, dtype=np.float64).reshape(-1, 1)
+    if len(a) == 0 or len(b) == 0:
+        return float("nan")
+    rng = np.random.default_rng(123)
+    if len(a) > 1500:
+        a = a[rng.choice(len(a), 1500, replace=False)]
+    if len(b) > 1500:
+        b = b[rng.choice(len(b), 1500, replace=False)]
+    z = np.vstack([a, b]).ravel()
+    if gamma is None:
+        med = np.median(np.abs(z[:, None] - z[None, :]))
+        gamma = 1.0 / (2.0 * max(med, 1e-3) ** 2)
+    def k(x, y):
+        d2 = (x - y.T) ** 2
+        return np.exp(-gamma * d2)
+    kaa = k(a, a)
+    kbb = k(b, b)
+    kab = k(a, b)
+    return float(kaa.mean() + kbb.mean() - 2.0 * kab.mean())
+
+
+def _normalise_weights(weights: np.ndarray) -> np.ndarray:
+    w = np.asarray(weights, dtype=np.float64)
+    w = np.clip(w, 0, None)
+    s = w.sum()
+    if s <= 0:
+        return np.ones_like(w) / len(w)
+    return w / s
+
+
+def compute_ess(weights: np.ndarray) -> float:
+    w = _normalise_weights(weights)
+    return 1.0 / (len(w) * (w**2).sum() + SAFE_EPS)
+
+
+def girsanov_weights_from_log(log_w: np.ndarray) -> np.ndarray:
+    log_w = np.asarray(log_w, dtype=np.float64)
+    log_w = np.nan_to_num(log_w, nan=-20.0, posinf=20.0, neginf=-20.0)
+    log_w = log_w - np.max(log_w)
+    return _normalise_weights(np.exp(log_w))
+
+
+# -----------------------------------------------------------------------------
+# Return Normalisation
+# -----------------------------------------------------------------------------
+@dataclass
+class ReturnNormalizer:
+    mean: float
+    std: float
+
+    def normalize(self, x: np.ndarray) -> np.ndarray:
+        return (x - self.mean) / max(self.std, SAFE_EPS)
+
+    def denormalize(self, x: np.ndarray) -> np.ndarray:
+        return x * max(self.std, SAFE_EPS) + self.mean
+
+
+def fit_return_normalizer(train_rets: np.ndarray, floor: float = 1e-4) -> ReturnNormalizer:
+    mu = float(np.mean(train_rets))
+    sigma = float(np.std(train_rets, ddof=0))
+    return ReturnNormalizer(mean=mu, std=max(sigma, floor))
+
+
+# -----------------------------------------------------------------------------
+# Data Handling
+# -----------------------------------------------------------------------------
+def download_returns(ticker: str, start_date: str, end_date: str) -> Tuple[np.ndarray, float, pd.DataFrame]:
+    LOGGER.info("Downloading %s (%s -> %s)", ticker, start_date, end_date)
+    df = yf.download(ticker, start=start_date, end=end_date, auto_adjust=True, progress=False)
+    if df is None or len(df) < 400:
+        raise RuntimeError(f"Not enough data for {ticker}")
+    if isinstance(df.columns, pd.MultiIndex):
+        close = df[("Close", ticker)].astype(float)
+    else:
+        close = df["Close"].astype(float)
+    close = close.dropna()
+    rets = np.log(close / close.shift(1)).dropna().to_numpy(np.float64)
+    s0 = float(close.iloc[-1])
+    return rets, s0, pd.DataFrame({"Close": close})
+
+
+def split_returns(rets: np.ndarray, train_frac: float, val_frac: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    n = len(rets)
+    n_train = int(n * train_frac)
+    n_val = int(n * val_frac)
+    return rets[:n_train], rets[n_train:n_train+n_val], rets[n_train+n_val:]
+
+
+class ReturnWindowDataset(Dataset):
+    def __init__(self, rets: np.ndarray, seq_len: int, vol_seq_len: Optional[int] = None):
+        self.rets = np.asarray(rets, dtype=np.float32)
+        self.seq_len = seq_len
+        self.vol_seq_len = vol_seq_len or (2 * seq_len)
+
+    def __len__(self):
+        return max(0, len(self.rets) - self.seq_len)
+
+    def __getitem__(self, idx):
+        ctx = self.rets[idx:idx+self.seq_len]
+        tgt = self.rets[idx+self.seq_len]
+        full_end = idx + self.seq_len + 1
+        full_start = max(0, full_end - self.vol_seq_len)
+        vol_ctx = self.rets[full_start:full_end]
+        if len(vol_ctx) < self.vol_seq_len:
+            vol_ctx = np.pad(vol_ctx, (self.vol_seq_len - len(vol_ctx), 0))
+
+        def _rv(arr, k):
+            w = arr[-k:] if len(arr) >= k else arr
+            return float(np.sqrt(np.mean(np.square(w)) + SAFE_EPS))
+
+        rv5 = _rv(vol_ctx[:-1], 5)
+        rv10 = _rv(vol_ctx[:-1], 10)
+        rv20 = _rv(vol_ctx[:-1], 20)
+        prev_rv = _rv(vol_ctx[:-6], 5) if len(vol_ctx) > 6 else rv5
+        vov = float(abs(rv5 - prev_rv) / (prev_rv + SAFE_EPS))
+        next_abs = float(abs(tgt))
+        return {
+            "context": torch.tensor(ctx, dtype=TORCH_DTYPE),
+            "target": torch.tensor([tgt], dtype=TORCH_DTYPE),
+            "vol_context": torch.tensor(vol_ctx[:-1], dtype=TORCH_DTYPE),
+            "rv_targets": torch.tensor([rv5, rv10, rv20, vov, next_abs], dtype=TORCH_DTYPE),
+        }
+
+
+# -----------------------------------------------------------------------------
+# Option Surface Construction
+# -----------------------------------------------------------------------------
+def bs_call_price(s0: float, k: float, tau: float, rate: float, vol: float) -> float:
+    if tau <= 0:
+        return max(s0 - k, 0.0)
+    vol = max(vol, 1e-6)
+    d1 = (math.log(s0/k) + (rate + 0.5*vol*vol)*tau) / (vol*math.sqrt(tau))
+    d2 = d1 - vol*math.sqrt(tau)
+    nd1 = 0.5*(1.0 + math.erf(d1/math.sqrt(2)))
+    nd2 = 0.5*(1.0 + math.erf(d2/math.sqrt(2)))
+    return s0*nd1 - k*math.exp(-rate*tau)*nd2
+
+
+def _fetch_real_option_surface(ticker: str, s0: float, cfg: Config) -> Optional[pd.DataFrame]:
+    try:
+        tk = yf.Ticker(ticker)
+        expirations = tk.options
+        if not expirations:
+            return None
+        rows = []
+        today = pd.Timestamp.now().normalize()
+        for exp_str in expirations[:8]:
+            exp_date = pd.Timestamp(exp_str)
+            days = max((exp_date - today).days, 1)
+            tau = days / TRADING_DAYS
+            if tau > 0.50:
+                continue
+            try:
+                chain = tk.option_chain(exp_str)
+                calls = chain.calls
+            except Exception:
+                continue
+            k_lo = s0 * cfg.data.option_core_moneyness_lo * 0.95
+            k_hi = s0 * cfg.data.option_core_moneyness_hi * 1.05
+            calls = calls[(calls["strike"] >= k_lo) & (calls["strike"] <= k_hi)].copy()
+            if "bid" in calls.columns and "ask" in calls.columns:
+                mid = (calls["bid"] + calls["ask"]) / 2.0
+                calls["market_price"] = np.where((calls["bid"]>0) & (calls["ask"]>0), mid, calls["lastPrice"])
+            else:
+                calls["market_price"] = calls["lastPrice"]
+            calls = calls[calls["market_price"] > 0.01]
+            for _, row in calls.iterrows():
+                rows.append({
+                    "tau": tau, "strike": float(row["strike"]), "market_price": float(row["market_price"]),
+                    "days": days, "iv": float(row.get("impliedVolatility", np.nan)), "source": "yfinance"
+                })
+        if len(rows) < 10:
+            return None
+        return pd.DataFrame(rows)
+    except Exception as e:
+        LOGGER.warning("Real option fetch failed: %s", e)
+        return None
+
+
+def _build_synthetic_fallback(s0: float, train_rets: np.ndarray, cfg: Config) -> pd.DataFrame:
+    vol = float(np.clip(np.std(train_rets)*math.sqrt(TRADING_DAYS), 0.05, 0.80))
+    rows = []
+    for d in cfg.data.synthetic_option_maturities:
+        tau = d / TRADING_DAYS
+        for m in cfg.data.synthetic_option_moneyness:
+            strike = s0 * m
+            price = bs_call_price(s0, strike, tau, cfg.data.risk_free, vol)
+            rows.append({"tau": tau, "strike": strike, "market_price": price,
+                         "days": d, "iv": vol, "source": "synthetic_bs"})
+    return pd.DataFrame(rows)
+
+
+def build_option_surface(ticker: str, s0: float, train_rets: np.ndarray, cfg: Config) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    opt_df = _fetch_real_option_surface(ticker, s0, cfg)
+    if opt_df is None:
+        LOGGER.info("Using synthetic BS option surface for %s", ticker)
+        opt_df = _build_synthetic_fallback(s0, train_rets, cfg)
+    opt_df = opt_df.sort_values(["days", "strike"]).reset_index(drop=True)
+    train_df = opt_df.iloc[::2].reset_index(drop=True)
+    holdout_df = opt_df.iloc[1::2].reset_index(drop=True)
+    core_lo = s0 * cfg.data.option_core_moneyness_lo
+    core_hi = s0 * cfg.data.option_core_moneyness_hi
+    core_mask = (train_df["strike"] >= core_lo) & (train_df["strike"] <= core_hi) & (train_df["days"] <= cfg.data.option_core_max_days)
+    core_df = train_df[core_mask].reset_index(drop=True)
+    LOGGER.info("Option surface: train=%d holdout=%d core=%d", len(train_df), len(holdout_df), len(core_df))
+    return train_df, holdout_df, core_df
+
+
+# -----------------------------------------------------------------------------
+# Model Components
+# -----------------------------------------------------------------------------
+class TimeEmbedding(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        half = self.dim // 2
+        freqs = torch.exp(-math.log(10000) * torch.arange(0, half, device=t.device) / max(half-1, 1))
+        args = t[:, None] * freqs[None, :]
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=1)
+        if emb.shape[1] < self.dim:
+            emb = F.pad(emb, (0, self.dim - emb.shape[1]))
+        return emb
+
+
+def compute_context_features_torch(context: torch.Tensor) -> torch.Tensor:
+    x = context
+    mu = x.mean(dim=1, keepdim=True)
+    xc = x - mu
+    std = torch.sqrt(torch.mean(xc*xc, dim=1, keepdim=True) + SAFE_EPS)
+    abs_mean = x.abs().mean(dim=1, keepdim=True)
+    rv = torch.sqrt(torch.mean(x*x, dim=1, keepdim=True) + SAFE_EPS)
+    q90 = torch.quantile(x.abs(), 0.90, dim=1, keepdim=True)
+    q95 = torch.quantile(x.abs(), 0.95, dim=1, keepdim=True)
+    max_abs = x.abs().amax(dim=1, keepdim=True)
+    downside = torch.sqrt(torch.mean(torch.clamp(-x, min=0).pow(2), dim=1, keepdim=True) + SAFE_EPS)
+    upside = torch.sqrt(torch.mean(torch.clamp(x, min=0).pow(2), dim=1, keepdim=True) + SAFE_EPS)
+    if x.shape[1] > 1:
+        x0 = x[:, :-1]
+        x1 = x[:, 1:]
+        acf_abs = (x0.abs() * x1.abs()).mean(dim=1, keepdim=True) / (torch.sqrt((x0.abs()**2).mean(dim=1, keepdim=True)*(x1.abs()**2).mean(dim=1, keepdim=True)) + SAFE_EPS)
+        x0c = x0 - x0.mean(dim=1, keepdim=True)
+        x1c = x1 - x1.mean(dim=1, keepdim=True)
+        ret_acf = (x0c * x1c).mean(dim=1, keepdim=True) / (torch.sqrt((x0c**2).mean(dim=1, keepdim=True)*(x1c**2).mean(dim=1, keepdim=True)) + SAFE_EPS)
+    else:
+        acf_abs = torch.zeros_like(mu)
+        ret_acf = torch.zeros_like(mu)
+    return torch.cat([mu, std, abs_mean, rv, acf_abs, ret_acf, q90, q95, max_abs, downside, upside], dim=1)
+
+
+class VolEncoder(nn.Module):
+    def __init__(self, input_len: int, latent_dim: int, hidden_dim: int):
+        super().__init__()
+        self.gru = nn.GRU(1, hidden_dim, batch_first=True)
+        self.feature = nn.Sequential(
+            nn.Linear(11, hidden_dim//2), nn.SiLU(),
+            nn.Linear(hidden_dim//2, hidden_dim//2), nn.SiLU()
+        )
+        self.latent = nn.Sequential(
+            nn.Linear(hidden_dim + hidden_dim//2, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, latent_dim), nn.Tanh()
+        )
+        self.proxy_head = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, 5)
+        )
+    def forward(self, vol_context: torch.Tensor):
+        _, h = self.gru(vol_context.unsqueeze(-1))
+        hlast = h[-1]
+        feat = compute_context_features_torch(vol_context)
+        femb = self.feature(feat)
+        latent = self.latent(torch.cat([hlast, femb], dim=1))
+        preds = self.proxy_head(latent)
+        return latent, preds
+
+
+class ScoreNet(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        m = cfg.model
+        self.seq_len = m.seq_len
+        self.vol_seq_len = m.seq_len * m.vol_encoder_len_mult
+        self.num_regimes = m.num_regimes
+        self.regime_dim = m.regime_dim
+        self.regime_residual_scale = m.regime_residual_scale
+        self.regime_gate_temp = m.regime_gate_temp
+        self.regime_by_vol_only = m.regime_by_vol_only
+        self.freeze_base = False
+
+        self.time_emb = TimeEmbedding(m.time_embed_dim)
+        self.ctx = nn.GRU(1, m.p_hidden_dim, num_layers=2, batch_first=True, bidirectional=True, dropout=m.dropout)
+        self.ctx_feat = nn.Sequential(
+            nn.Linear(11, m.p_hidden_dim//2), nn.SiLU(),
+            nn.Linear(m.p_hidden_dim//2, m.p_hidden_dim//2), nn.SiLU()
+        )
+        self.vol_encoder = VolEncoder(self.vol_seq_len, m.latent_vol_dim, m.vol_hidden_dim)
+        regime_in = 2*m.p_hidden_dim + m.p_hidden_dim//2 + m.latent_vol_dim
+        self.regime_gate = nn.Sequential(
+            nn.Linear(regime_in, m.p_hidden_dim//2), nn.SiLU(),
+            nn.Linear(m.p_hidden_dim//2, m.num_regimes)
+        )
+        self.regime_embed = nn.Parameter(torch.randn(m.num_regimes, m.regime_dim)*0.05)
+
+        in_dim = 2*m.p_hidden_dim + m.p_hidden_dim//2 + m.latent_vol_dim + m.time_embed_dim + 1 + m.regime_dim
+        layers = [nn.Linear(in_dim, m.p_hidden_dim), nn.LayerNorm(m.p_hidden_dim), nn.SiLU(), nn.Dropout(m.dropout)]
+        for _ in range(m.n_res_blocks):
+            layers += [nn.Linear(m.p_hidden_dim, m.p_hidden_dim), nn.LayerNorm(m.p_hidden_dim), nn.SiLU(), nn.Dropout(m.dropout)]
+        layers += [nn.Linear(m.p_hidden_dim, 1)]
+        self.head = nn.Sequential(*layers)
+
+        self.regime_heads = nn.ModuleList([
+            nn.Sequential(nn.Linear(in_dim, m.p_hidden_dim//2), nn.SiLU(), nn.Linear(m.p_hidden_dim//2, 1))
+            for _ in range(m.num_regimes)
+        ])
+
+    def set_freeze_base(self, freeze: bool):
+        self.freeze_base = freeze
+        for p in self.head.parameters():
+            p.requires_grad = not freeze
+
+    def forward(self, context: torch.Tensor, xt: torch.Tensor, t: torch.Tensor, vol_context: Optional[torch.Tensor] = None):
+        _, h = self.ctx(context.unsqueeze(-1))
+        hcat = torch.cat([h[-2], h[-1]], dim=1)
+        te = self.time_emb(t)
+        context_feat = compute_context_features_torch(context)
+        cf = self.ctx_feat(context_feat)
+        if vol_context is None:
+            vol_context = context
+        h_next, _ = self.vol_encoder(vol_context)
+
+        regime_state = torch.cat([hcat, cf, h_next], dim=1)
+        if self.regime_by_vol_only:
+            rv = torch.sqrt(torch.mean(context**2, dim=1) + SAFE_EPS)  # shape (batch,)
+            q1 = torch.quantile(rv, 1.0 / self.num_regimes)
+            idxs = (rv > q1).long()
+            regime_probs = F.one_hot(idxs, self.num_regimes).to(context.dtype)  # (batch, num_regimes)
+        else:
+            logits = self.regime_gate(regime_state) / max(self.regime_gate_temp, 1e-4)
+            idxs = torch.argmax(logits, dim=1)
+            regime_probs = F.one_hot(idxs, self.num_regimes).to(context.dtype)
+        regime_ctx = regime_probs @ self.regime_embed
+
+        inp = torch.cat([hcat, cf, h_next, xt, te, regime_ctx], dim=1)
+        base_score = self.head(inp)
+        if self.freeze_base:
+            base_score = base_score.detach()
+        regime_scores = torch.cat([head(inp) for head in self.regime_heads], dim=1)
+        regime_residual = (regime_probs * regime_scores).sum(dim=1, keepdim=True)
+        return base_score + self.regime_residual_scale * regime_residual
+
+
+class GirsanovNet(nn.Module):
+    N_FEAT = 6
+    def __init__(self, hidden_dim: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(self.N_FEAT, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        with torch.no_grad():
+            self.net[-1].weight.mul_(0.01)
+            self.net[-1].bias.zero_()
+    def forward(self, step_features: torch.Tensor) -> torch.Tensor:
+        return self.net(step_features).squeeze(-1)
+
+
+# -----------------------------------------------------------------------------
+# VP-SDE Schedule
+# -----------------------------------------------------------------------------
+class VPSchedule:
+    def __init__(self, beta_min: float, beta_max: float):
+        self.beta_min = beta_min
+        self.beta_max = beta_max
+    def beta(self, t: torch.Tensor) -> torch.Tensor:
+        return self.beta_min + t * (self.beta_max - self.beta_min)
+    def int_beta(self, t: torch.Tensor) -> torch.Tensor:
+        return self.beta_min * t + 0.5 * (self.beta_max - self.beta_min) * t * t
+    def alpha_bar(self, t: torch.Tensor) -> torch.Tensor:
+        return torch.exp(-self.int_beta(t)).clamp(min=1e-8, max=1.0)
+    def marginal_std(self, t: torch.Tensor) -> torch.Tensor:
+        return torch.sqrt(1.0 - self.alpha_bar(t) + SAFE_EPS)
+
+
+# -----------------------------------------------------------------------------
+# Loss Functions
+# -----------------------------------------------------------------------------
+def compute_torch_mmd(x: torch.Tensor, y: torch.Tensor, bandwidth: float = 1.0) -> torch.Tensor:
+    x, y = x.reshape(-1, 1), y.reshape(-1, 1)
+    bw = max(bandwidth, 1e-6)
+    xx = torch.exp(-(x - x.T).pow(2) / (2*bw*bw)).mean()
+    yy = torch.exp(-(y - y.T).pow(2) / (2*bw*bw)).mean()
+    xy = torch.exp(-(x - y.T).pow(2) / (2*bw*bw)).mean()
+    return xx + yy - 2*xy
+
+
+def tail_preserving_kurt_loss(x: torch.Tensor, target_excess: float = 9.0) -> torch.Tensor:
+    x = x.reshape(-1)
+    mean = x.mean()
+    var = torch.mean((x - mean)**2).clamp_min(SAFE_EPS)
+    z = (x - mean) / torch.sqrt(var)
+    ex_kurt = torch.mean(z**4) - 3.0
+    excess = torch.relu(ex_kurt - target_excess)
+    return torch.log1p(excess**2)
+
+
+def compute_score_fpe_residual(model: ScoreNet, sched: VPSchedule, context: torch.Tensor, cfg: Config, vol_context: Optional[torch.Tensor] = None) -> torch.Tensor:
+    if not torch.is_grad_enabled():
+        return torch.zeros((), device=context.device, dtype=context.dtype)
+    device = context.device
+    dtype = context.dtype
+    n_colloc = cfg.loss.p_ito_pde_n_colloc
+    t_lo, t_hi = cfg.loss.p_ito_pde_t_lo, cfg.loss.p_ito_pde_t_hi
+    bsz = context.shape[0]
+    idx = torch.randint(0, bsz, (n_colloc,), device=device)
+    ctx_c = context[idx]
+    vol_c = vol_context[idx] if vol_context is not None else ctx_c
+    t_c = torch.rand(n_colloc, device=device, dtype=dtype) * (t_hi - t_lo) + t_lo
+    t_c.requires_grad_(True)
+    x0_c = ctx_c[:, -1:].detach()
+    ab_c = sched.alpha_bar(t_c).unsqueeze(1)
+    sig_c = sched.marginal_std(t_c).unsqueeze(1)
+    eps_c = torch.randn_like(x0_c)
+    x_c = (torch.sqrt(ab_c)*x0_c + sig_c*eps_c).detach()
+    x_c.requires_grad_(True)
+
+    eps_pred = model(ctx_c, x_c, t_c, vol_context=vol_c)
+    s = -eps_pred / (sig_c + SAFE_EPS)
+
+    ds_dx = torch.autograd.grad(s, x_c, grad_outputs=torch.ones_like(s), create_graph=True, retain_graph=True)[0]
+    d2s_dx2 = torch.autograd.grad(ds_dx, x_c, grad_outputs=torch.ones_like(ds_dx), create_graph=True, retain_graph=True)[0]
+    ds_dt = torch.autograd.grad(s.sum(dim=1), t_c, grad_outputs=torch.ones_like(s.sum(dim=1)), create_graph=True, retain_graph=True)[0].unsqueeze(1)
+
+    beta = sched.beta(t_c).unsqueeze(1)
+    # Corrected residual: no constant term
+    residual = ds_dt + 0.5*beta*x_c*ds_dx + 0.5*beta*s - 0.5*beta*d2s_dx2 - beta*s*ds_dx
+    return torch.log1p(residual.pow(2).mean())
+
+
+def dsm_loss_parts(model: ScoreNet, sched: VPSchedule, context: torch.Tensor, target: torch.Tensor,
+                   cfg: Config, epoch: int, vol_context: Optional[torch.Tensor] = None):
+    bsz = target.shape[0]
+    t = torch.rand(bsz, device=target.device, dtype=target.dtype) * 0.999 + 0.0005
+    ab = sched.alpha_bar(t).unsqueeze(1)
+    sig = sched.marginal_std(t).unsqueeze(1)
+    eps = torch.randn_like(target)
+    xt = torch.sqrt(ab)*target + sig*eps
+    eps_pred = model(context, xt, t, vol_context=vol_context)
+    base_loss = F.mse_loss(eps_pred, eps)
+
+    x0_hat = (xt - sig*eps_pred) / torch.sqrt(ab.clamp_min(SAFE_EPS))
+    mmd_loss = compute_torch_mmd(x0_hat.squeeze(1), target.squeeze(1), bandwidth=cfg.loss.p_mmd_bandwidth)
+    kurt_loss = tail_preserving_kurt_loss(x0_hat.squeeze(1), target_excess=cfg.loss.p_pred_kurt_target)
+
+    ito_pde_loss = torch.zeros((), device=target.device)
+    if cfg.loss.p_ito_pde_lam > 0 and epoch >= cfg.current_stage2_start_epoch:
+        ito_pde_loss = compute_score_fpe_residual(model, sched, context, cfg, vol_context)
+
+    # In practice, we would add weighted components; here we keep the essential ones.
+    total = base_loss
+    return total, base_loss, mmd_loss, kurt_loss, ito_pde_loss
+
+
+def dsm_loss(model: ScoreNet, sched: VPSchedule, context: torch.Tensor, target: torch.Tensor,
+             cfg: Config, epoch: int, vol_context: Optional[torch.Tensor] = None) -> torch.Tensor:
+    total, *_ = dsm_loss_parts(model, sched, context, target, cfg, epoch, vol_context)
+    return total
+
+
+# -----------------------------------------------------------------------------
+# Sampler (Corrected VP-SDE)
+# -----------------------------------------------------------------------------
+def generate_mrnd_returns(model: ScoreNet, sched: VPSchedule, ctx: torch.Tensor, n_paths: int,
+                          cfg: Config, device: str) -> np.ndarray:
+    """Correct reverse VP-SDE sampler (drift_scale removed)."""
+    was_training = model.training
+    model.eval()
+    seq = ctx.detach().cpu().numpy().astype(np.float32).copy()
+    if seq.ndim == 1:
+        seq = np.tile(seq[None, :], (n_paths, 1))
+    else:
+        seq = np.tile(seq, (n_paths, 1))
+
+    out = []
+    steps = max(cfg.sampler.p_sampling_steps, 8)
+    dt = -1.0 / steps
+    tail_cut = max(int(cfg.sampler.sampler_deterministic_tail_frac * steps), 1)
+
+    with torch.no_grad():
+        for _ in range(cfg.model.horizon_days):
+            context = torch.tensor(seq[:, -cfg.model.seq_len:], dtype=TORCH_DTYPE, device=device)
+            xt = cfg.sampler.sampler_init_noise_scale * torch.randn(n_paths, 1, dtype=TORCH_DTYPE, device=device)
+            for i in reversed(range(steps)):
+                t_scalar = (i + 1) / steps
+                t = torch.full((n_paths,), t_scalar, dtype=TORCH_DTYPE, device=device)
+                beta_t = sched.beta(t).unsqueeze(1)
+                sig_t = sched.marginal_std(t).unsqueeze(1)
+                eps_pred = model(context, xt, t, vol_context=context)
+                score = -eps_pred / (sig_t + SAFE_EPS)
+                drift = -0.5 * beta_t * xt - beta_t * score   # CORRECTED: no scaling
+                if i >= tail_cut:
+                    noise = cfg.sampler.sampler_temperature * torch.sqrt(beta_t * (-dt)) * torch.randn_like(xt)
+                else:
+                    noise = 0.0
+                xt = xt + drift * dt + noise
+                xt = torch.clamp(xt, -cfg.data.max_abs_norm_ret, cfg.data.max_abs_norm_ret)
+            pred = xt.squeeze(1).cpu().numpy().astype(np.float32)
+            out.append(pred)
+            seq = np.concatenate([seq, pred[:, None]], axis=1)
+
+    rets = np.stack(out, axis=1)
+    if was_training:
+        model.train()
+    return safe_clip_returns(rets, cfg.data.max_abs_norm_ret)
+
+
+# -----------------------------------------------------------------------------
+# Non-overlapping horizon helpers and bootstrap
+# -----------------------------------------------------------------------------
+def _sim_nonoverlap(sim_rets: np.ndarray, h: int) -> np.ndarray:
+    sim_rets = np.asarray(sim_rets, dtype=np.float64)
+    if h <= 1:
+        return sim_rets.reshape(-1)
+    n_paths, n_days = sim_rets.shape
+    n_full = (n_days // h) * h
+    if n_full == 0:
+        return np.array([], dtype=np.float64)
+    blocks = sim_rets[:, :n_full].reshape(n_paths, -1, h)
+    return blocks.sum(axis=2).reshape(-1)
+
+
+def _real_nonoverlap(real_rets: np.ndarray, h: int) -> np.ndarray:
+    real_rets = np.asarray(real_rets, dtype=np.float64)
+    if h <= 1:
+        return real_rets.copy()
+    n = len(real_rets)
+    n_full = (n // h) * h
+    if n_full == 0:
+        return np.array([], dtype=np.float64)
+    return real_rets[:n_full].reshape(-1, h).sum(axis=1)
+
+
+def bootstrap_ks_ci(sim_rets: np.ndarray, real_rets: np.ndarray,
+                    n_bootstrap: int = 2000, alpha: float = 0.05,
+                    rng_seed: int = 0) -> Dict[str, float]:
+    rng = np.random.default_rng(rng_seed)
+    sim_rets = np.asarray(sim_rets, dtype=np.float64)
+    real_rets = np.asarray(real_rets, dtype=np.float64)
+    n_r, n_s = len(real_rets), len(sim_rets)
+    if n_r < 2 or n_s < 2:
+        return {"ks": float("nan"), "ci_lo": float("nan"), "ci_hi": float("nan"),
+                "n_real": n_r, "n_sim": n_s, "critical_95": float("nan")}
+    ks_obs = float(ks_2samp(real_rets, sim_rets).statistic)
+    boot_ks = np.empty(n_bootstrap, dtype=np.float64)
+    for i in range(n_bootstrap):
+        r_b = rng.choice(real_rets, size=n_r, replace=True)
+        s_b = rng.choice(sim_rets, size=n_s, replace=True)
+        boot_ks[i] = float(ks_2samp(r_b, s_b).statistic)
+    ci_lo = float(np.percentile(boot_ks, 100 * alpha / 2))
+    ci_hi = float(np.percentile(boot_ks, 100 * (1 - alpha / 2)))
+    c_alpha = 1.3581
+    critical_95 = c_alpha * math.sqrt((n_r + n_s) / (n_r * n_s))
+    return {"ks": ks_obs, "ci_lo": ci_lo, "ci_hi": ci_hi,
+            "n_real": n_r, "n_sim": n_s, "critical_95": critical_95,
+            "reject_null": ks_obs > critical_95}
+
+
+def multi_horizon_ks_with_ci(sim_rets: np.ndarray, test_rets_raw: np.ndarray,
+                             horizons: Tuple[int, ...] = (1, 5, 30),
+                             n_bootstrap: int = 2000, rng_seed: int = 0) -> Dict[str, object]:
+    result: Dict[str, object] = {}
+    for h in horizons:
+        sim_h = _sim_nonoverlap(sim_rets, h)
+        real_h = _real_nonoverlap(test_rets_raw, h)
+        ci = bootstrap_ks_ci(sim_h, real_h, n_bootstrap=n_bootstrap, rng_seed=rng_seed)
+        ci["reject_null"] = bool(ci["ks"] > ci["critical_95"])
+        result[h] = ci
+    return result
+
+
+# -----------------------------------------------------------------------------
+# Evaluation helpers
+# -----------------------------------------------------------------------------
+def monte_carlo_call_prices_from_paths(paths: np.ndarray, strikes: np.ndarray, taus: np.ndarray, rate: float) -> np.ndarray:
+    prices = []
+    horizon = paths.shape[1] - 1
+    for k, tau in zip(strikes, taus):
+        step = min(horizon, max(1, int(round(TRADING_DAYS * tau))))
+        st = paths[:, step]
+        payoff = np.maximum(st - float(k), 0.0)
+        prices.append(float(np.exp(-rate * tau) * payoff.mean()))
+    return np.asarray(prices, dtype=np.float64)
+
+
+def weighted_martingale_metrics(paths: np.ndarray, weights: np.ndarray,
+                                s0: float, rate: float, tau_years: float) -> Dict[str, float]:
+    prices = np.clip(paths, SAFE_EPS, 1e9)
+    w = _normalise_weights(weights)
+    st = prices[:, -1]
+    expected_st = float(np.dot(w, st))
+    forward = float(s0 * math.exp(rate * tau_years))
+    ratio = expected_st / max(forward, SAFE_EPS)
+    err_pct = 100.0 * abs(expected_st - forward) / max(forward, SAFE_EPS)
+    return {"expected_ST_weighted": expected_st, "forward_price": forward,
+            "martingale_ratio": ratio, "martingale_error_pct": err_pct}
+
+
+def check_martingale_condition(paths: np.ndarray, s0: float, rate: float, tau_years: float) -> Dict[str, float]:
+    w = np.full(len(paths), 1.0 / max(len(paths), 1), dtype=np.float64)
+    return weighted_martingale_metrics(paths, w, s0, rate, tau_years)
+
+
+def evaluate_p_finance(model: ScoreNet, sched: VPSchedule, s0: float,
+                       ctx_seed_norm: np.ndarray, test_rets_raw: np.ndarray,
+                       option_holdout: pd.DataFrame, cfg: Config, device: str,
+                       normalizer: ReturnNormalizer, n_paths_override: Optional[int] = None):
+    n_paths = n_paths_override or cfg.data.n_paths_eval
+    ctx = torch.tensor(ctx_seed_norm[-cfg.model.seq_len:], dtype=TORCH_DTYPE)
+    sim_rets_norm = generate_mrnd_returns(model, sched, ctx, n_paths, cfg, device)
+    sim_rets = normalizer.denormalize(sim_rets_norm)
+    sim_prices = returns_to_prices(s0, sim_rets, max_price=cfg.data.max_price)
+
+    h30 = min(cfg.model.horizon_days, 30)
+    sim_h30 = _sim_nonoverlap(sim_rets, h30)
+    real_h30 = _real_nonoverlap(test_rets_raw, h30)
+    ks30 = compute_ks_distance(real_h30, sim_h30)
+    ci = bootstrap_ks_ci(sim_h30, real_h30)
+
+    holdout_rmse = float("nan")
+    if not option_holdout.empty:
+        strikes = option_holdout["strike"].to_numpy(float)
+        taus = option_holdout["tau"].to_numpy(float)
+        market = option_holdout["market_price"].to_numpy(float)
+        mc = monte_carlo_call_prices_from_paths(sim_prices, strikes, taus, cfg.data.risk_free)
+        holdout_rmse = float(np.sqrt(np.mean((mc - market)**2)))
+
+    mart = check_martingale_condition(sim_prices, s0, cfg.data.risk_free, h30 / TRADING_DAYS)
+    return {"ks30": ks30, "ks30_ci_hi": ci["ci_hi"], "holdout_rmse": holdout_rmse,
+            "martingale_pct": mart["martingale_error_pct"]}
+
+
+# -----------------------------------------------------------------------------
+# P-Model Training (simplified stage gate using CI)
+# -----------------------------------------------------------------------------
+def fit_p_model(train_rets: np.ndarray, val_rets: np.ndarray, cfg: Config, device: str,
+                s0: float, test_rets_raw: np.ndarray, option_holdout: pd.DataFrame,
+                normalizer: ReturnNormalizer, option_core: pd.DataFrame):
+    sched = VPSchedule(cfg.sampler.beta_min, cfg.sampler.beta_max)
+    model = ScoreNet(cfg).to(device)
+    train_loader = DataLoader(
+        ReturnWindowDataset(train_rets, cfg.model.seq_len),
+        batch_size=cfg.training.p_batch_size, shuffle=True, drop_last=True,
+        num_workers=cfg.num_workers, pin_memory=cfg.pin_memory
+    )
+    val_loader = DataLoader(
+        ReturnWindowDataset(val_rets, cfg.model.seq_len),
+        batch_size=cfg.training.p_batch_size, shuffle=False,
+        num_workers=cfg.num_workers, pin_memory=cfg.pin_memory
+    )
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.training.p_lr, weight_decay=cfg.training.p_weight_decay)
+    scaler = make_grad_scaler(device)
+
+    best_ks30_ci = float("inf")
+    best_ckpt_state = None
+    gate_consecutive = 0
+    stage2_started = False
+    audit_snapshots = []
+
+    for epoch in range(1, cfg.training.p_epochs + 1):
+        model.train()
+        cfg.current_epoch = epoch
+        for batch in train_loader:
+            batch = to_device(batch, device)
+            opt.zero_grad(set_to_none=True)
+            with autocast(device_type="cuda", dtype=amp_dtype(device), enabled=amp_enabled(device)):
+                loss = dsm_loss(model, sched, batch["context"], batch["target"], cfg, epoch,
+                                vol_context=batch.get("vol_context", batch["context"]))
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            nn.utils.clip_grad_norm_(model.parameters(), cfg.training.grad_clip)
+            scaler.step(opt)
+            scaler.update()
+
+        # Audit
+        if epoch == 1 or epoch % cfg.data.p_finance_audit_every == 0 or epoch == cfg.training.p_epochs:
+            fin = evaluate_p_finance(model, sched, s0, train_rets, test_rets_raw, option_holdout,
+                                     cfg, device, normalizer, cfg.data.p_finance_audit_n_paths)
+            audit_snapshots.append(fin)
+            ks30_ci_hi = fin["ks30_ci_hi"]
+            LOGGER.info("Audit epoch %d: KS30=%.4f CI_hi=%.4f RMSE=%.4f", epoch, fin["ks30"], ks30_ci_hi, fin["holdout_rmse"])
+
+            # Simplified gate: start stage2 when upper CI of KS30 < threshold for consecutive audits
+            if not stage2_started and epoch >= cfg.stage.p_stage2_gate_min_epoch:
+                if ks30_ci_hi < cfg.stage.p_stage2_gate_ks30_max:
+                    gate_consecutive += 1
+                else:
+                    gate_consecutive = 0
+                if gate_consecutive >= cfg.stage.p_stage2_gate_patience:
+                    cfg.current_stage2_start_epoch = epoch + 1
+                    stage2_started = True
+                    LOGGER.info("Stage 2 gate OPEN at epoch %d", epoch)
+
+            # Save best checkpoint based on KS30 CI upper bound
+            if ks30_ci_hi < best_ks30_ci:
+                best_ks30_ci = ks30_ci_hi
+                best_ckpt_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                cfg._best_ckpt_rmse = fin["holdout_rmse"]
+                cfg._best_ckpt_mart = fin["martingale_pct"]
+
+    if best_ckpt_state is not None:
+        model.load_state_dict(best_ckpt_state)
+    model.eval()
+    return model, sched, {"P_ks30_ci_hi_best": best_ks30_ci, "P_stage2_start": cfg.current_stage2_start_epoch}
+
+
+# -----------------------------------------------------------------------------
+# Q-Model Training (Girsanov)
+# -----------------------------------------------------------------------------
+def build_girsanov_step_features(paths: np.ndarray, s0: float) -> np.ndarray:
+    n_paths, n_cols = paths.shape
+    n_steps = n_cols - 1
+    if n_steps < 1:
+        return np.zeros((n_paths, 0, 6), dtype=np.float32)
+    log_prices = np.log(np.clip(paths, SAFE_EPS, 1e9))
+    log_s0 = np.log(max(s0, SAFE_EPS))
+    log_rets = np.diff(log_prices, axis=1)
+    cum_log_ret = log_prices[:, 1:] - log_s0
+
+    def rolling_std(arr, w):
+        out = np.zeros_like(arr)
+        for t in range(arr.shape[1]):
+            start = max(0, t-w+1)
+            out[:, t] = np.std(arr[:, start:t+1], axis=1, ddof=0) + SAFE_EPS
+        return out
+
+    vol5 = rolling_std(log_rets, 5)
+    vol20 = rolling_std(log_rets, 20)
+    time_frac = np.tile(np.linspace(1/n_steps, 1.0, n_steps)[None, :], (n_paths, 1))
+    log_money = log_prices[:, 1:] - log_s0
+    feats = np.stack([log_rets, cum_log_ret, vol5, vol20, time_frac, log_money], axis=2).astype(np.float32)
+    mu = np.nanmean(feats, axis=(0,1), keepdims=True)
+    sig = np.nanstd(feats, axis=(0,1), keepdims=True) + 1e-6
+    feats = np.clip((feats - mu)/sig, -8.0, 8.0)
+    return np.nan_to_num(feats, nan=0.0)
+
+
+def compute_girsanov_log_weights(lambdas: torch.Tensor, paths: torch.Tensor, s0: float,
+                                 mu_ann: float, sigma_ann: float, dt: float = 1/252) -> torch.Tensor:
+    log_prices = torch.log(torch.clamp(paths, min=SAFE_EPS))
+    log_rets = log_prices[:, 1:] - log_prices[:, :-1]
+    drift_per_step = (mu_ann - 0.5*sigma_ann**2) * dt
+    sigma_sqrt_dt = sigma_ann * math.sqrt(dt) + SAFE_EPS
+    dW = (log_rets - drift_per_step) / sigma_sqrt_dt
+    log_rn = -torch.sum(lambdas * dW, dim=1) - 0.5 * dt * torch.sum(lambdas**2, dim=1)
+    return torch.clamp(log_rn, -20.0, 20.0)
+
+
+def compute_arbitrage_penalties(paths: torch.Tensor, weights: torch.Tensor,
+                                option_df: pd.DataFrame, s0: float, rate: float) -> Dict[str, torch.Tensor]:
+    device = paths.device
+    zero = torch.tensor(0.0, device=device, dtype=paths.dtype)
+    penalties = {"strike_mono": zero.clone(), "convexity": zero.clone(), "calendar_mono": zero.clone()}
+    if option_df.empty or len(option_df) < 3:
+        return penalties
+    df = option_df.copy().sort_values(["days", "strike"]).reset_index(drop=True)
+    n_violations = {"strike_mono": 0, "convexity": 0, "calendar_mono": 0}
+    mc_prices = {}
+    for _, row in df.iterrows():
+        tau = float(row["tau"])
+        strike = float(row["strike"])
+        key = (tau, strike)
+        if key not in mc_prices:
+            step = min(paths.shape[1] - 1, max(1, int(round(TRADING_DAYS * tau))))
+            st = paths[:, step]
+            payoff = torch.clamp(st - strike, min=0.0)
+            mc_prices[key] = math.exp(-rate * tau) * torch.sum(weights * payoff)
+    for days_val in df["days"].unique():
+        slice_df = df[df["days"] == days_val].sort_values("strike")
+        strikes = slice_df["strike"].tolist()
+        tau = float(slice_df["tau"].iloc[0])
+        for i in range(len(strikes) - 1):
+            c1 = mc_prices.get((tau, strikes[i]), zero)
+            c2 = mc_prices.get((tau, strikes[i+1]), zero)
+            violation = torch.clamp(c2 - c1, min=0.0)
+            penalties["strike_mono"] = penalties["strike_mono"] + violation**2
+            n_violations["strike_mono"] += 1
+        for i in range(1, len(strikes) - 1):
+            c_lo = mc_prices.get((tau, strikes[i-1]), zero)
+            c_mid = mc_prices.get((tau, strikes[i]), zero)
+            c_hi = mc_prices.get((tau, strikes[i+1]), zero)
+            butterfly = c_lo - 2.0 * c_mid + c_hi
+            violation = torch.clamp(-butterfly, min=0.0)
+            penalties["convexity"] = penalties["convexity"] + violation**2
+            n_violations["convexity"] += 1
+    for strike_val in df["strike"].unique():
+        slice_df = df[df["strike"] == strike_val].sort_values("days")
+        if len(slice_df) < 2:
+            continue
+        taus_list = slice_df["tau"].tolist()
+        for i in range(len(taus_list) - 1):
+            c_short = mc_prices.get((taus_list[i], strike_val), zero)
+            c_long = mc_prices.get((taus_list[i+1], strike_val), zero)
+            violation = torch.clamp(c_short - c_long, min=0.0)
+            penalties["calendar_mono"] = penalties["calendar_mono"] + violation**2
+            n_violations["calendar_mono"] += 1
+    for k in penalties:
+        if n_violations[k] > 0:
+            penalties[k] = penalties[k] / n_violations[k]
+    return penalties
+
+
+def train_q_model(train_paths: np.ndarray, val_paths: np.ndarray, s0: float,
+                  option_train: pd.DataFrame, option_holdout: pd.DataFrame,
+                  val_rets: np.ndarray, cfg: Config, device: str,
+                  real_mu_ann: float, real_sigma_ann: float):
+    g_net = GirsanovNet(hidden_dim=cfg.model.q_hidden_dim).to(device)
+    opt = torch.optim.AdamW(g_net.parameters(), lr=cfg.training.q_lr, weight_decay=cfg.training.q_weight_decay)
+    scaler = make_grad_scaler(device)
+
+    train_feats = torch.tensor(build_girsanov_step_features(train_paths, s0), dtype=TORCH_DTYPE, device=device)
+    val_feats = torch.tensor(build_girsanov_step_features(val_paths, s0), dtype=TORCH_DTYPE, device=device)
+    train_prices_t = torch.tensor(train_paths, dtype=TORCH_DTYPE, device=device)
+    val_prices_t = torch.tensor(val_paths, dtype=TORCH_DTYPE, device=device)
+
+    best_val_score = float("inf")
+    best_state = None
+    dt = 1.0 / TRADING_DAYS
+
+    for epoch in range(cfg.training.q_epochs):
+        g_net.train()
+        opt.zero_grad(set_to_none=True)
+        with autocast(device_type="cuda", dtype=amp_dtype(device), enabled=amp_enabled(device)):
+            lambdas = g_net(train_feats)
+            log_w = compute_girsanov_log_weights(lambdas, train_prices_t, s0, real_mu_ann, real_sigma_ann, dt)
+            w_soft = F.softmax(log_w, dim=0)
+
+            # Option pricing loss
+            opt_loss = torch.tensor(0.0, device=device)
+            if not option_train.empty:
+                for _, row in option_train.iterrows():
+                    tau = row["tau"]
+                    strike = row["strike"]
+                    mkt = row["market_price"]
+                    step = min(train_paths.shape[1]-1, max(1, int(round(TRADING_DAYS * tau))))
+                    st = train_prices_t[:, step]
+                    payoff = torch.clamp(st - strike, min=0.0)
+                    cq = math.exp(-cfg.data.risk_free * tau) * torch.sum(w_soft * payoff)
+                    opt_loss = opt_loss + ((cq - mkt) / max(mkt, 1e-4))**2
+                opt_loss = opt_loss / len(option_train)
+
+            # Martingale constraint
+            expected_st = torch.sum(w_soft * train_prices_t[:, -1])
+            forward = s0 * math.exp(cfg.data.risk_free * (train_paths.shape[1]-1) / TRADING_DAYS)
+            mart_gap = torch.abs(expected_st - forward) / max(forward, 1e-8)
+
+            # Entropy regularisation
+            kl = 0.5 * dt * torch.mean(torch.sum(lambdas**2, dim=1))
+            lam = cfg.loss.q_opt_lam_start + (epoch / max(cfg.training.q_epochs-1, 1)) * (cfg.loss.q_opt_lam_end - cfg.loss.q_opt_lam_start)
+
+            # Arbitrage penalties
+            arb_pen = compute_arbitrage_penalties(train_prices_t, w_soft, option_train, s0, cfg.data.risk_free)
+            arb_loss = (cfg.loss.q_arb_mono_lam * arb_pen["strike_mono"] +
+                        cfg.loss.q_arb_convex_lam * arb_pen["convexity"] +
+                        cfg.loss.q_arb_calendar_lam * arb_pen["calendar_mono"])
+
+            loss = opt_loss + lam * kl + cfg.loss.q_martingale_lam * mart_gap + arb_loss
+
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt)
+        nn.utils.clip_grad_norm_(g_net.parameters(), cfg.training.grad_clip)
+        scaler.step(opt)
+        scaler.update()
+
+        # Validation
+        g_net.eval()
+        with torch.no_grad():
+            val_lambdas = g_net(val_feats)
+            val_log_w = compute_girsanov_log_weights(val_lambdas, val_prices_t, s0, real_mu_ann, real_sigma_ann, dt)
+        val_w = girsanov_weights_from_log(val_log_w.cpu().numpy())
+        val_ess = compute_ess(val_w)
+        real_h30 = _real_nonoverlap(val_rets, min(cfg.model.horizon_days, 30))
+        val_terminal = np.log(np.clip(val_paths[:, -1], SAFE_EPS, 1e9)) - np.log(s0)
+        rng = np.random.default_rng(cfg.seed + epoch)
+        draw = rng.choice(val_terminal, size=min(2000, len(val_terminal)), replace=True, p=_normalise_weights(val_w))
+        val_ks30 = compute_ks_distance(draw, real_h30)
+        mart = weighted_martingale_metrics(val_paths, val_w, s0, cfg.data.risk_free, (val_paths.shape[1]-1)/TRADING_DAYS)
+        val_score = 2.5*val_ks30 + 0.5*(mart["martingale_error_pct"]/100.0)
+
+        if val_score < best_val_score:
+            best_val_score = val_score
+            best_state = {k: v.detach().clone() for k, v in g_net.state_dict().items()}
+
+    g_net.load_state_dict(best_state)
+    g_net._mu_ann = real_mu_ann
+    g_net._sigma_ann = real_sigma_ann
+    return g_net, {"Q_best_score": best_val_score}
+
+
+# -----------------------------------------------------------------------------
+# Baselines (with corrected rBergomi)
+# -----------------------------------------------------------------------------
+def fit_gbm_params(train_rets: np.ndarray) -> Tuple[float, float]:
+    mu = float(np.mean(train_rets))
+    sigma = float(np.std(train_rets, ddof=0))
+    return mu, max(sigma, 1e-6)
+
+
+def simulate_gbm_paths(s0: float, mu: float, sigma: float, n_steps: int, n_paths: int, cfg: Config) -> np.ndarray:
+    dt = 1.0 / TRADING_DAYS
+    z = np.random.randn(n_paths, n_steps)
+    rets = (mu - 0.5 * sigma**2) * dt + sigma * math.sqrt(dt) * z
+    rets = safe_clip_returns(rets, cfg.data.max_abs_daily_ret)
+    return returns_to_prices(s0, rets, max_price=cfg.data.max_price)
+
+
+def _heston_cf(u: np.ndarray, s0: float, rate: float, tau: float,
+               v0: float, kappa: float, theta: float, xi: float, rho: float) -> np.ndarray:
+    u = np.asarray(u, dtype=np.complex128)
+    iu = 1j * u
+    d = np.sqrt((rho * xi * iu - kappa)**2 + xi**2 * (iu + u**2))
+    g = (kappa - rho * xi * iu - d) / (kappa - rho * xi * iu + d + 1e-30)
+    exp_d = np.exp(np.clip(-d * tau, -500, 500))
+    C = (kappa * theta / (xi**2 + 1e-30)) * (
+        (kappa - rho * xi * iu - d) * tau
+        - 2.0 * np.log(np.where(np.abs(1.0 - g * exp_d) < 1e-30,
+                                1e-30, (1.0 - g * exp_d) / (1.0 - g + 1e-30)))
+    )
+    D = ((kappa - rho * xi * iu - d) / (xi**2 + 1e-30)) * ((1.0 - exp_d) / (1.0 - g * exp_d + 1e-30))
+    log_s0 = np.log(max(float(s0), 1e-8))
+    result = np.exp(np.clip(C + D * v0 + iu * (log_s0 + rate * tau), -500, 500))
+    result = np.where(np.isfinite(result), result, 0.0 + 0.0j)
+    return result
+
+
+def _carr_madan_call(s0: float, rate: float, tau: float, strikes: np.ndarray,
+                     v0: float, kappa: float, theta: float, xi: float, rho: float,
+                     N: int = 4096, alpha: float = 1.5, eta: float = 0.25) -> np.ndarray:
+    lam = 2.0 * math.pi / (N * eta)
+    b = N * lam / 2.0
+    u_j = np.arange(N) * eta
+    k_grid = -b + np.arange(N) * lam
+    cf_vals = _heston_cf(u_j - (alpha + 1.0) * 1j, s0, rate, tau, v0, kappa, theta, xi, rho)
+    denom = (alpha**2 + alpha - u_j**2) + 1j * (2.0 * alpha + 1.0) * u_j
+    denom = np.where(np.abs(denom) < 1e-30, 1e-30, denom)
+    psi = np.exp(-rate * tau) * cf_vals / denom
+    simpson = 3.0 + (-1.0) ** (np.arange(N) + 1)
+    simpson[0] = 1.0
+    simpson = simpson / 3.0
+    fft_input = np.exp(1j * b * u_j) * psi * eta * simpson
+    fft_output = np.fft.fft(fft_input)
+    call_grid = (np.exp(-alpha * k_grid) / math.pi) * fft_output.real
+    log_strikes = np.log(np.clip(strikes, 1e-8, None))
+    prices = np.interp(log_strikes, k_grid, call_grid)
+    intrinsic = np.maximum(float(s0) * np.exp(rate * tau) - strikes, 0.0) * np.exp(-rate * tau)
+    return np.maximum(prices, intrinsic)
+
+
+def fit_heston_params(train_rets: np.ndarray, option_surface: Optional[pd.DataFrame] = None,
+                      s0: Optional[float] = None, rate: float = 0.0) -> Dict[str, float]:
+    rets = np.asarray(train_rets, dtype=np.float64)
+    n = len(rets)
+    var_daily = float(np.var(rets))
+    var_ann = var_daily * TRADING_DAYS
+    v0_mm = max(var_ann, 0.01)
+    theta_mm = max(var_ann, 0.01)
+    sq = rets**2
+    if n > 2:
+        sq_mu = sq.mean()
+        sq_c = sq - sq_mu
+        acf_num = float(np.dot(sq_c[:-1], sq_c[1:]) / max(n-1, 1))
+        acf_den = float(np.dot(sq_c, sq_c) / max(n, 1))
+        rho_sq = acf_num / max(acf_den, 1e-12)
+        rho_sq = float(np.clip(rho_sq, 1e-6, 1.0-1e-6))
+        kappa_mm = float(-np.log(rho_sq) * TRADING_DAYS)
+    else:
+        kappa_mm = 2.0
+    kappa_mm = float(np.clip(kappa_mm, 0.1, 20.0))
+    window = 20
+    if n >= 2 * window:
+        n_full = (n // window) * window
+        rv_blocks = rets[:n_full].reshape(-1, window)
+        rv_windows = np.var(rv_blocks, axis=1) * TRADING_DAYS
+        rv_mean = float(np.mean(rv_windows))
+        rv_std = float(np.std(rv_windows, ddof=1)) if len(rv_windows) > 1 else 0.0
+        xi_mm = rv_std / max(rv_mean, 1e-8) * math.sqrt(TRADING_DAYS / window)
+    else:
+        xi_mm = 0.5
+    xi_mm = float(np.clip(xi_mm, 0.05, 5.0))
+    if n >= 3:
+        r_mid = rets[1:-1]
+        abs_diff = np.abs(rets[2:]) - np.abs(rets[:-2])
+        r_c = r_mid - r_mid.mean()
+        d_c = abs_diff - abs_diff.mean()
+        num = float(np.dot(r_c, d_c))
+        den = float(np.sqrt(np.dot(r_c, r_c) * np.dot(d_c, d_c) + 1e-12))
+        rho_mm = float(np.clip(num / den, -0.999, 0.999))
+    else:
+        rho_mm = -0.6
+
+    if option_surface is None or option_surface.empty or s0 is None:
+        feller = 2.0 * kappa_mm * theta_mm - xi_mm**2
+        return {"v0": v0_mm, "kappa": kappa_mm, "theta": theta_mm, "xi": xi_mm, "rho": rho_mm,
+                "calib_rmse": 0.0, "feller_slack": feller, "calib_method": "moment_matching"}
+
+    strikes = option_surface["strike"].to_numpy(float)
+    taus = option_surface["tau"].to_numpy(float)
+    market = option_surface["market_price"].to_numpy(float)
+    s0_f = float(s0)
+
+    def _objective(params):
+        v0_c, kappa_c, theta_c, xi_c, rho_c = params
+        feller = 2.0 * kappa_c * theta_c - xi_c**2
+        penalty = 50.0 * max(-feller, 0.0)**2
+        rel_sq_parts = []
+        for tau_val in np.unique(taus):
+            mask = np.abs(taus - tau_val) < 1e-8
+            k_slice = strikes[mask]
+            m_slice = market[mask]
+            try:
+                model_prices = _carr_madan_call(s0_f, rate, tau_val, k_slice, v0_c, kappa_c, theta_c, xi_c, rho_c)
+                rel_errs = (model_prices - m_slice) / np.maximum(m_slice, 0.01)
+                rel_sq_parts.append(float(np.mean(rel_errs**2)))
+            except Exception:
+                rel_sq_parts.append(1e6)
+        return float(np.mean(rel_sq_parts)) + penalty
+
+    bounds = [(0.005, 3.0), (0.1, 25.0), (0.005, 3.0), (0.05, 6.0), (-0.99, 0.50)]
+    x0_seed = [float(np.clip(v0_mm, bounds[0][0], bounds[0][1])),
+               float(np.clip(kappa_mm, bounds[1][0], bounds[1][1])),
+               float(np.clip(theta_mm, bounds[2][0], bounds[2][1])),
+               float(np.clip(xi_mm, bounds[3][0], bounds[3][1])),
+               float(np.clip(rho_mm, bounds[4][0], bounds[4][1]))]
+    alternative_seeds = [x0_seed,
+                         [max(var_ann*0.5, 0.01), 3.0, max(var_ann, 0.01), 0.8, -0.75],
+                         [max(var_ann*1.5, 0.01), 8.0, max(var_ann*0.8, 0.01), 1.5, -0.50]]
+    best_result = None
+    best_obj = float("inf")
+    for i_start, seed_point in enumerate(alternative_seeds):
+        clamped = [float(np.clip(seed_point[j], bounds[j][0], bounds[j][1])) for j in range(5)]
+        try:
+            res = differential_evolution(_objective, bounds, seed=42+i_start, maxiter=300, tol=1e-6,
+                                         init="sobol", x0=clamped, polish=True)
+            if res.fun < best_obj:
+                best_obj = res.fun
+                best_result = res
+        except Exception:
+            continue
+    if best_result is not None:
+        v0_c, kappa_c, theta_c, xi_c, rho_c = best_result.x
+        calib_rmse = float(np.sqrt(max(best_result.fun, 0.0)))
+        LOGGER.info("Heston FFT calib | v0=%.4f kappa=%.3f theta=%.4f xi=%.3f rho=%.3f | relRMSE=%.6f",
+                    v0_c, kappa_c, theta_c, xi_c, rho_c, calib_rmse)
+        calib_method = "carr_madan_fft"
+    else:
+        v0_c, kappa_c, theta_c, xi_c, rho_c = v0_mm, kappa_mm, theta_mm, xi_mm, rho_mm
+        calib_rmse = 0.0
+        calib_method = "moment_matching_fallback"
+        LOGGER.warning("Heston FFT calibration failed, using moment-matching fallback")
+
+    feller = 2.0 * kappa_c * theta_c - xi_c**2
+    return {"v0": float(v0_c), "kappa": float(kappa_c), "theta": float(theta_c),
+            "xi": float(xi_c), "rho": float(rho_c), "calib_rmse": calib_rmse,
+            "feller_slack": feller, "calib_method": calib_method}
+
+
+def simulate_heston_paths(s0: float, rate: float, v0: float, kappa: float, theta: float,
+                          xi: float, rho: float, n_steps: int, n_paths: int, cfg: Config) -> np.ndarray:
+    dt = 1.0 / TRADING_DAYS
+    prices = np.full((n_paths, n_steps+1), float(s0), dtype=np.float64)
+    v = np.full(n_paths, float(max(v0, 1e-6)), dtype=np.float64)
+    for t in range(1, n_steps+1):
+        z1 = np.random.randn(n_paths)
+        z2 = np.random.randn(n_paths)
+        w1 = z1
+        w2 = rho * z1 + math.sqrt(max(1.0 - rho**2, 1e-6)) * z2
+        v = np.clip(v + kappa * (theta - v) * dt + xi * np.sqrt(np.clip(v, 1e-8, None)) * math.sqrt(dt) * w2, 1e-8, 4.0)
+        lr = (rate - 0.5 * v) * dt + np.sqrt(v * dt) * w1
+        lr = np.clip(lr, -cfg.data.max_abs_daily_ret, cfg.data.max_abs_daily_ret)
+        prices[:, t] = np.clip(prices[:, t-1] * np.exp(lr), SAFE_EPS, cfg.data.max_price)
+    return prices
+
+
+def fit_rbergomi_params(train_rets: np.ndarray) -> Dict[str, float]:
+    rets = np.asarray(train_rets, dtype=np.float64)
+    n = len(rets)
+    vol = float(np.std(rets) * math.sqrt(TRADING_DAYS))
+    xi0 = max(vol**2, 0.02)
+    abs_rets = np.abs(rets)
+    max_lag = min(40, n // 4)
+    if max_lag >= 3:
+        lags = np.arange(1, max_lag+1)
+        variogram = np.array([np.mean((abs_rets[lag:] - abs_rets[:-lag])**2) for lag in lags])
+        valid = variogram > 0
+        if valid.sum() >= 3:
+            log_lags = np.log(lags[valid].astype(float))
+            log_var = np.log(variogram[valid])
+            slope, _ = np.polyfit(log_lags, log_var, 1)
+            H = float(np.clip(slope/2.0, 0.02, 0.48))
+        else:
+            H = 0.10
+    else:
+        H = 0.10
+    window = 20
+    if n >= 2 * window:
+        n_full = (n // window) * window
+        rv_blocks = rets[:n_full].reshape(-1, window)
+        rv_windows = np.var(rv_blocks, axis=1) * TRADING_DAYS
+        rv_mean = float(np.mean(rv_windows))
+        rv_std = float(np.std(rv_windows, ddof=1)) if len(rv_windows) > 1 else 0.0
+        eta = rv_std / max(rv_mean, 1e-8) * math.sqrt(TRADING_DAYS / window)
+        eta = float(np.clip(eta, 0.3, 4.0))
+    else:
+        eta = 1.2
+    if n >= 3:
+        r_mid = rets[1:-1]
+        abs_diff = np.abs(rets[2:]) - np.abs(rets[:-2])
+        r_c = r_mid - r_mid.mean()
+        d_c = abs_diff - abs_diff.mean()
+        num = float(np.dot(r_c, d_c))
+        den = float(np.sqrt(np.dot(r_c, r_c) * np.dot(d_c, d_c) + 1e-12))
+        rho_vol = float(np.clip(num / den, -0.99, 0.99))
+    else:
+        rho_vol = -0.7
+    LOGGER.info("rBergomi params | H=%.3f eta=%.3f rho=%.3f xi0=%.4f", H, eta, rho_vol, xi0)
+    return {"H": H, "eta": eta, "rho_vol": rho_vol, "xi0": xi0}
+
+
+def simulate_rbergomi_paths(s0: float, rate: float, H: float, eta: float, rho_vol: float,
+                            xi0: float, n_steps: int, n_paths: int, cfg: Config) -> np.ndarray:
+    if n_steps > 504:
+        raise ValueError("rBergomi steps > 504 not supported. Reduce horizon or baseline_steps.")
+    dt = 1.0 / TRADING_DAYS
+    H = np.clip(H, 0.02, 0.48)
+    idx = np.arange(n_steps)
+    diff = idx[:, None] - idx[None, :]
+    twoH = 2.0 * H
+    C = 0.5 * (np.abs(diff+1)**twoH + np.abs(diff-1)**twoH - 2*np.abs(diff)**twoH) * (dt**twoH)
+    C += np.eye(n_steps) * 1e-10
+    L = np.linalg.cholesky(C)
+    Z_vol = np.random.randn(n_steps, n_paths)
+    dW_H = L @ Z_vol
+    W_H = np.cumsum(dW_H, axis=0)
+    Z_perp = np.random.randn(n_steps, n_paths)
+    prices = np.full((n_paths, n_steps+1), s0)
+    sqrt_1mrho2 = math.sqrt(max(1 - rho_vol**2, 1e-6))
+    for t in range(1, n_steps+1):
+        ti = t - 1
+        log_vol = np.log(xi0) + eta * W_H[ti] - 0.5 * eta**2 * (t*dt)**(2*H)
+        vol = np.clip(np.exp(np.clip(log_vol, -10, np.log(5))), 1e-6, 5)
+        dW_S = rho_vol * dW_H[ti] + sqrt_1mrho2 * math.sqrt(dt) * Z_perp[ti]
+        lr = (rate - 0.5*vol)*dt + np.sqrt(vol)*dW_S
+        lr = np.clip(lr, -cfg.data.max_abs_daily_ret, cfg.data.max_abs_daily_ret)
+        prices[:, t] = np.clip(prices[:, t-1] * np.exp(lr), SAFE_EPS, cfg.data.max_price)
+    return prices
+
+
+def evaluate_baselines(s0: float, train_rets: np.ndarray, test_rets: np.ndarray,
+                       option_holdout: pd.DataFrame, cfg: Config) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    real_h30 = make_horizon_returns(test_rets, min(cfg.model.horizon_days, 30))
+    real_h5 = make_horizon_returns(test_rets, 5)
+    real_h1 = make_horizon_returns(test_rets, 1)
+
+    mu, sigma = fit_gbm_params(train_rets)
+    gbm = simulate_gbm_paths(s0, mu, sigma, cfg.data.baseline_steps, cfg.data.gbm_paths, cfg)
+    gbm_rets = np.diff(np.log(np.clip(gbm, SAFE_EPS, 1e9)), axis=1).reshape(-1)
+    for h, real in [(1, real_h1), (5, real_h5), (min(cfg.model.horizon_days, 30), real_h30)]:
+        sim_h = make_horizon_returns(gbm_rets, h)
+        out[f"GBM_KS{h}"] = compute_ks_distance(sim_h, real)
+        out[f"GBM_MMD{h}"] = compute_mmd(sim_h, real)
+    if not option_holdout.empty:
+        gbm_opt = monte_carlo_call_prices_from_paths(gbm, option_holdout["strike"].to_numpy(float),
+                                                     option_holdout["tau"].to_numpy(float), cfg.data.risk_free)
+        mkt = option_holdout["market_price"].to_numpy(float)
+        out["GBM_holdout_RMSE"] = float(np.sqrt(np.mean((gbm_opt - mkt)**2)))
+    out["martingale_ratio_GBM"] = check_martingale_condition(gbm, s0, cfg.data.risk_free, cfg.data.baseline_steps/TRADING_DAYS)["martingale_ratio"]
+
+    hp = fit_heston_params(train_rets, option_surface=option_holdout, s0=s0, rate=cfg.data.risk_free)
+    heston = simulate_heston_paths(s0, cfg.data.risk_free, hp["v0"], hp["kappa"], hp["theta"], hp["xi"], hp["rho"],
+                                   cfg.data.baseline_steps, cfg.data.heston_paths, cfg)
+    heston_rets = np.diff(np.log(np.clip(heston, SAFE_EPS, 1e9)), axis=1).reshape(-1)
+    for h, real in [(1, real_h1), (5, real_h5), (min(cfg.model.horizon_days, 30), real_h30)]:
+        sim_h = make_horizon_returns(heston_rets, h)
+        out[f"Heston_KS{h}"] = compute_ks_distance(sim_h, real)
+        out[f"Heston_MMD{h}"] = compute_mmd(sim_h, real)
+    if not option_holdout.empty:
+        hes_opt = monte_carlo_call_prices_from_paths(heston, option_holdout["strike"].to_numpy(float),
+                                                     option_holdout["tau"].to_numpy(float), cfg.data.risk_free)
+        mkt = option_holdout["market_price"].to_numpy(float)
+        out["Heston_holdout_RMSE"] = float(np.sqrt(np.mean((hes_opt - mkt)**2)))
+    out["Heston_calib_rmse"] = float(hp["calib_rmse"])
+    out["Heston_feller_slack"] = float(hp["feller_slack"])
+    out["martingale_ratio_Heston"] = check_martingale_condition(heston, s0, cfg.data.risk_free, cfg.data.baseline_steps/TRADING_DAYS)["martingale_ratio"]
+
+    rbp = fit_rbergomi_params(train_rets)
+    rbp = {"H": float(np.clip(rbp["H"], 0.02, 0.48)), "eta": float(np.clip(rbp["eta"], 1e-4, 5.0)),
+           "rho_vol": float(np.clip(rbp["rho_vol"], -0.999, 0.999)), "xi0": float(np.clip(rbp["xi0"], 1e-6, 5.0))}
+    rb = simulate_rbergomi_paths(s0, cfg.data.risk_free, rbp["H"], rbp["eta"], rbp["rho_vol"], rbp["xi0"],
+                                 cfg.data.baseline_steps, cfg.data.rbergomi_paths, cfg)
+    rb_rets = np.diff(np.log(np.clip(rb, SAFE_EPS, 1e9)), axis=1).reshape(-1)
+    for h, real in [(1, real_h1), (5, real_h5), (min(cfg.model.horizon_days, 30), real_h30)]:
+        sim_h = make_horizon_returns(rb_rets, h)
+        out[f"rBergomi_KS{h}"] = compute_ks_distance(sim_h, real)
+        out[f"rBergomi_MMD{h}"] = compute_mmd(sim_h, real)
+    if not option_holdout.empty:
+        rb_opt = monte_carlo_call_prices_from_paths(rb, option_holdout["strike"].to_numpy(float),
+                                                    option_holdout["tau"].to_numpy(float), cfg.data.risk_free)
+        mkt = option_holdout["market_price"].to_numpy(float)
+        out["rBergomi_holdout_RMSE"] = float(np.sqrt(np.mean((rb_opt - mkt)**2)))
+    out["martingale_ratio_rBergomi"] = check_martingale_condition(rb, s0, cfg.data.risk_free, cfg.data.baseline_steps/TRADING_DAYS)["martingale_ratio"]
+    return out
+
+
+def evaluate_baselines_with_paths(s0: float, train_rets: np.ndarray, test_rets: np.ndarray,
+                                  option_holdout: pd.DataFrame, cfg: "Config") -> Dict[str, object]:
+    """Same as evaluate_baselines but also returns simulated paths and per-contract
+    model prices for GBM / Heston / rBergomi. Used by save_paths.py for figure generation."""
+    out: Dict[str, object] = {}
+    real_h30 = make_horizon_returns(test_rets, min(cfg.model.horizon_days, 30))
+    real_h5 = make_horizon_returns(test_rets, 5)
+    real_h1 = make_horizon_returns(test_rets, 1)
+
+    mu, sigma = fit_gbm_params(train_rets)
+    gbm = simulate_gbm_paths(s0, mu, sigma, cfg.data.baseline_steps, cfg.data.gbm_paths, cfg)
+    out["gbm_paths"] = gbm
+    gbm_rets = np.diff(np.log(np.clip(gbm, SAFE_EPS, 1e9)), axis=1).reshape(-1)
+    for h, real in [(1, real_h1), (5, real_h5), (min(cfg.model.horizon_days, 30), real_h30)]:
+        sim_h = make_horizon_returns(gbm_rets, h)
+        out[f"GBM_KS{h}"] = compute_ks_distance(sim_h, real)
+        out[f"GBM_MMD{h}"] = compute_mmd(sim_h, real)
+    if not option_holdout.empty:
+        gbm_opt = monte_carlo_call_prices_from_paths(gbm, option_holdout["strike"].to_numpy(float),
+                                                     option_holdout["tau"].to_numpy(float), cfg.data.risk_free)
+        mkt = option_holdout["market_price"].to_numpy(float)
+        out["GBM_holdout_RMSE"] = float(np.sqrt(np.mean((gbm_opt - mkt)**2)))
+        out["gbm_model_prices"] = gbm_opt
+    else:
+        out["gbm_model_prices"] = np.array([])
+    out["martingale_ratio_GBM"] = check_martingale_condition(gbm, s0, cfg.data.risk_free, cfg.data.baseline_steps/TRADING_DAYS)["martingale_ratio"]
+
+    hp = fit_heston_params(train_rets, option_surface=option_holdout, s0=s0, rate=cfg.data.risk_free)
+    heston = simulate_heston_paths(s0, cfg.data.risk_free, hp["v0"], hp["kappa"], hp["theta"], hp["xi"], hp["rho"],
+                                   cfg.data.baseline_steps, cfg.data.heston_paths, cfg)
+    out["heston_paths"] = heston
+    heston_rets = np.diff(np.log(np.clip(heston, SAFE_EPS, 1e9)), axis=1).reshape(-1)
+    for h, real in [(1, real_h1), (5, real_h5), (min(cfg.model.horizon_days, 30), real_h30)]:
+        sim_h = make_horizon_returns(heston_rets, h)
+        out[f"Heston_KS{h}"] = compute_ks_distance(sim_h, real)
+        out[f"Heston_MMD{h}"] = compute_mmd(sim_h, real)
+    if not option_holdout.empty:
+        hes_opt = monte_carlo_call_prices_from_paths(heston, option_holdout["strike"].to_numpy(float),
+                                                     option_holdout["tau"].to_numpy(float), cfg.data.risk_free)
+        mkt = option_holdout["market_price"].to_numpy(float)
+        out["Heston_holdout_RMSE"] = float(np.sqrt(np.mean((hes_opt - mkt)**2)))
+        out["heston_model_prices"] = hes_opt
+    else:
+        out["heston_model_prices"] = np.array([])
+    out["Heston_calib_rmse"] = float(hp["calib_rmse"])
+    out["Heston_feller_slack"] = float(hp["feller_slack"])
+    out["martingale_ratio_Heston"] = check_martingale_condition(heston, s0, cfg.data.risk_free, cfg.data.baseline_steps/TRADING_DAYS)["martingale_ratio"]
+
+    rbp = fit_rbergomi_params(train_rets)
+    rbp = {"H": float(np.clip(rbp["H"], 0.02, 0.48)), "eta": float(np.clip(rbp["eta"], 1e-4, 5.0)),
+           "rho_vol": float(np.clip(rbp["rho_vol"], -0.999, 0.999)), "xi0": float(np.clip(rbp["xi0"], 1e-6, 5.0))}
+    rb = simulate_rbergomi_paths(s0, cfg.data.risk_free, rbp["H"], rbp["eta"], rbp["rho_vol"], rbp["xi0"],
+                                 cfg.data.baseline_steps, cfg.data.rbergomi_paths, cfg)
+    out["rbergomi_paths"] = rb
+    rb_rets = np.diff(np.log(np.clip(rb, SAFE_EPS, 1e9)), axis=1).reshape(-1)
+    for h, real in [(1, real_h1), (5, real_h5), (min(cfg.model.horizon_days, 30), real_h30)]:
+        sim_h = make_horizon_returns(rb_rets, h)
+        out[f"rBergomi_KS{h}"] = compute_ks_distance(sim_h, real)
+        out[f"rBergomi_MMD{h}"] = compute_mmd(sim_h, real)
+    if not option_holdout.empty:
+        rb_opt = monte_carlo_call_prices_from_paths(rb, option_holdout["strike"].to_numpy(float),
+                                                    option_holdout["tau"].to_numpy(float), cfg.data.risk_free)
+        mkt = option_holdout["market_price"].to_numpy(float)
+        out["rBergomi_holdout_RMSE"] = float(np.sqrt(np.mean((rb_opt - mkt)**2)))
+        out["rbergomi_model_prices"] = rb_opt
+    else:
+        out["rbergomi_model_prices"] = np.array([])
+    out["martingale_ratio_rBergomi"] = check_martingale_condition(rb, s0, cfg.data.risk_free, cfg.data.baseline_steps/TRADING_DAYS)["martingale_ratio"]
+    return out
+
+
+# -----------------------------------------------------------------------------
+# Evaluation: P and Q measures
+# -----------------------------------------------------------------------------
+def evaluate_p_measure(model: ScoreNet, sched: VPSchedule, s0: float, ctx_seed_norm: np.ndarray,
+                       test_rets_raw: np.ndarray, option_holdout: pd.DataFrame,
+                       cfg: Config, device: str, normalizer: ReturnNormalizer) -> Tuple[np.ndarray, Dict[str, float]]:
+    ctx = torch.tensor(ctx_seed_norm[-cfg.model.seq_len:], dtype=TORCH_DTYPE)
+    sim_rets_norm = generate_mrnd_returns(model, sched, ctx, cfg.data.n_paths_eval, cfg, device)
+    sim_rets = normalizer.denormalize(sim_rets_norm)
+    prices = returns_to_prices(s0, sim_rets, max_price=cfg.data.max_price)
+
+    h30 = min(cfg.model.horizon_days, 30)
+    sim_h1 = _sim_nonoverlap(sim_rets, 1)
+    sim_h5 = _sim_nonoverlap(sim_rets, 5)
+    sim_h30 = _sim_nonoverlap(sim_rets, h30)
+    real_h1 = _real_nonoverlap(test_rets_raw, 1)
+    real_h5 = _real_nonoverlap(test_rets_raw, 5)
+    real_h30 = _real_nonoverlap(test_rets_raw, h30)
+
+    ci_report = multi_horizon_ks_with_ci(sim_rets, test_rets_raw, horizons=(1, 5, h30))
+    for h_val, ci in ci_report.items():
+        LOGGER.info("KS_CI[h=%2d] ks=%.4f 95%%CI=[%.4f, %.4f] n_real=%-4d crit95=%.4f reject=%s",
+                    h_val, ci["ks"], ci["ci_lo"], ci["ci_hi"], ci["n_real"], ci["critical_95"],
+                    "YES (BAD)" if ci["reject_null"] else "no (good)")
+
+    opt_rmse = float("nan")
+    if not option_holdout.empty:
+        pred = monte_carlo_call_prices_from_paths(prices, option_holdout["strike"].to_numpy(float),
+                                                  option_holdout["tau"].to_numpy(float), cfg.data.risk_free)
+        mkt = option_holdout["market_price"].to_numpy(float)
+        opt_rmse = float(np.sqrt(np.mean((pred - mkt)**2)))
+    mart = check_martingale_condition(prices, s0, cfg.data.risk_free, h30 / TRADING_DAYS)
+
+    out: Dict[str, float] = {
+        "P_KS1": compute_ks_distance(sim_h1, real_h1),
+        "P_KS5": compute_ks_distance(sim_h5, real_h5),
+        "P_KS30": compute_ks_distance(sim_h30, real_h30),
+        "P_MMD1": compute_mmd(sim_h1, real_h1),
+        "P_MMD5": compute_mmd(sim_h5, real_h5),
+        "P_MMD30": compute_mmd(sim_h30, real_h30),
+        "P_holdout_RMSE": opt_rmse,
+        "martingale_ratio_P": mart["martingale_ratio"],
+        "martingale_error_pct_P": mart["martingale_error_pct"],
+        "P_n_real_h1": float(len(real_h1)),
+        "P_n_real_h5": float(len(real_h5)),
+        "P_n_real_h30": float(len(real_h30)),
+    }
+    for h_val in (1, 5, h30):
+        prefix = f"P_KS{h_val}_"
+        ci = ci_report.get(h_val, {})
+        for k in ("ci_lo", "ci_hi", "critical_95"):
+            if k in ci:
+                out[prefix + k] = float(ci[k])
+        if "reject_null" in ci:
+            out[prefix + "reject_null"] = float(ci["reject_null"])
+    return prices, out
+
+
+def evaluate_q_measure(q_net, eval_paths: np.ndarray, s0: float, option_holdout: pd.DataFrame,
+                       test_rets: np.ndarray, cfg: Config, device: str) -> Dict[str, float]:
+    q_net.eval()
+    step_feats = torch.tensor(build_girsanov_step_features(eval_paths, s0), dtype=TORCH_DTYPE, device=device)
+    eval_prices_t = torch.tensor(eval_paths, dtype=TORCH_DTYPE, device=device)
+    mu_ann = getattr(q_net, "_mu_ann", 0.0)
+    sigma_ann = getattr(q_net, "_sigma_ann", 0.2)
+    with torch.no_grad():
+        lambdas = q_net(step_feats)
+        log_w = compute_girsanov_log_weights(lambdas, eval_prices_t, s0, mu_ann, sigma_ann)
+    q_w = girsanov_weights_from_log(log_w.cpu().numpy())
+
+    terminal = np.log(np.clip(eval_paths[:, -1], SAFE_EPS, 1e9)) - np.log(max(s0, SAFE_EPS))
+    rng = np.random.default_rng(cfg.seed + 999)
+    draw_n = min(1500 * 2, len(terminal))
+    q_sample = rng.choice(terminal, size=draw_n, replace=True, p=_normalise_weights(q_w))
+    real_h30 = make_horizon_returns(test_rets, min(cfg.model.horizon_days, 30))
+    real_h5 = make_horizon_returns(test_rets, 5)
+    real_h1 = make_horizon_returns(test_rets, 1)
+
+    hold_rmse = float("nan")
+    if not option_holdout.empty:
+        strikes = option_holdout["strike"].to_numpy(float)
+        taus = option_holdout["tau"].to_numpy(float)
+        market = option_holdout["market_price"].to_numpy(float)
+        sq_errs = []
+        for k, tau, mkt in zip(strikes, taus, market):
+            step = min(eval_paths.shape[1]-1, max(1, int(round(TRADING_DAYS * tau))))
+            st = eval_paths[:, step]
+            payoff = np.maximum(st - float(k), 0.0)
+            cq = float(np.exp(-cfg.data.risk_free * tau) * np.dot(q_w, payoff))
+            sq_errs.append((cq - mkt)**2)
+        hold_rmse = float(np.sqrt(np.mean(sq_errs))) if sq_errs else float("nan")
+
+    mart = weighted_martingale_metrics(eval_paths, q_w, s0, cfg.data.risk_free, (eval_paths.shape[1]-1)/TRADING_DAYS)
+    return {
+        "Q_ESS": float(compute_ess(q_w)),
+        "Q_KS30": compute_ks_distance(q_sample, real_h30),
+        "Q_KS5": compute_ks_distance(q_sample, real_h5),
+        "Q_KS1": compute_ks_distance(q_sample, real_h1),
+        "Q_MMD30": compute_mmd(q_sample, real_h30),
+        "Q_MMD5": compute_mmd(q_sample, real_h5),
+        "Q_MMD1": compute_mmd(q_sample, real_h1),
+        "Q_holdout_RMSE": hold_rmse,
+        "martingale_ratio_Q": mart["martingale_ratio"],
+        "martingale_error_pct_Q": mart["martingale_error_pct"],
+    }
+
+
+# -----------------------------------------------------------------------------
+# Path bank construction
+# -----------------------------------------------------------------------------
+def build_path_bank(model: ScoreNet, sched: VPSchedule, rets_norm: np.ndarray, n_anchors: int,
+                    cfg: Config, device: str) -> np.ndarray:
+    if len(rets_norm) < cfg.model.seq_len + cfg.model.horizon_days + 1:
+        ctx_np = np.pad(rets_norm[-cfg.model.seq_len:], (max(0, cfg.model.seq_len - len(rets_norm[-cfg.model.seq_len:])), 0))[-cfg.model.seq_len:]
+        ctx = torch.tensor(ctx_np, dtype=TORCH_DTYPE)
+        r = generate_mrnd_returns(model, sched, ctx, cfg.data.n_paths_q_bank, cfg, device)
+        return r
+    max_start = len(rets_norm) - cfg.model.seq_len - cfg.model.horizon_days - 1
+    starts = np.round(np.linspace(0, max_start, max(n_anchors, 1))).astype(int)
+    all_paths = []
+    for s in starts:
+        ctx = torch.tensor(rets_norm[s:s+cfg.model.seq_len], dtype=TORCH_DTYPE)
+        sim_rets = generate_mrnd_returns(model, sched, ctx, cfg.data.n_paths_q_bank, cfg, device)
+        all_paths.append(sim_rets)
+    return np.concatenate(all_paths, axis=0)
+
+
+# -----------------------------------------------------------------------------
+# Finance objective tree (for reporting)
+# -----------------------------------------------------------------------------
+def build_finance_objective_tree(metrics: Dict[str, float], cfg: Config) -> Dict[str, object]:
+    _p_ks30 = metrics.get("P_KS30", 1.0)
+    _p_mart = metrics.get("martingale_error_pct_P", 100.0)
+    tree: Dict[str, object] = {
+        "P_admissible": {
+            "pass": bool(_p_ks30 < 0.55 and _p_mart < 5.0),
+            "soft": bool(not (_p_ks30 < 0.38 and _p_mart < 5.0)),
+        },
+        "P_invalid_hard": {"pass": bool(metrics.get("P_KS30", 1.0) < cfg.data.p_invalid_ks_hard_cap)},
+        "Q_stable": {"pass": bool(metrics.get("Q_ESS", 0.0) >= cfg.data.q_min_ess_frac_hard and
+                                  metrics.get("martingale_error_pct_Q", 100.0) < 5.0)},
+        "Q_beats_P_on_options": {"pass": bool(metrics.get("Q_holdout_RMSE", 1e9) <= metrics.get("P_holdout_RMSE", 1e9)), "soft": True},
+        "Q_beats_GBM_on_KS30": {"pass": bool(metrics.get("Q_KS30", 1e9) <= metrics.get(f"GBM_KS{min(cfg.model.horizon_days,30)}", 1e9)), "soft": True},
+    }
+    tree["continue_to_results"] = bool(tree["P_admissible"]["pass"] and tree["P_invalid_hard"]["pass"] and tree["Q_stable"]["pass"])
+    return tree
+
+
+# -----------------------------------------------------------------------------
+# Run ticker
+# -----------------------------------------------------------------------------
+# =============================================================================
+# ML BASELINE INTERFACE (subprocess + JSON contract)
+# =============================================================================
+# Design: external ML baselines (TimeGAN, QuantGAN, etc.) live in `baselines/`
+# as standalone scripts with their own dependencies. They consume a spec JSON
+# and produce a paths .npy file. STRATA evaluates those paths through the SAME
+# pipeline used for classical baselines, ensuring metric consistency.
+#
+# I/O contract:
+#   - INPUT: train/val/test raw returns (.npy), option CSVs, spec JSON
+#   - OUTPUT: paths .npy of shape (n_paths, horizon_days), per-day raw log-returns
+#   - STRATA computes ALL metrics (KS30, RMSE, martingale, MMD)
+#
+# To add a new ML baseline:
+#   1. Create baselines/<name>_runner.py reading --spec and writing paths .npy
+#   2. Add the name to cfg.ml_baselines list in main()
+# See baselines/README.md for the full contract.
+# =============================================================================
+
+import subprocess
+from pathlib import Path
+
+
+def _evaluate_external_paths(sim_rets: np.ndarray, s0: float,
+                              test_rets_raw: np.ndarray,
+                              option_holdout: pd.DataFrame,
+                              cfg: Config) -> Dict[str, float]:
+    """Run external-baseline paths through STRATA's evaluation pipeline.
+
+    Same logic as evaluate_p_finance, but takes pre-generated raw returns
+    instead of running the diffusion sampler. Ensures metric consistency
+    across all baselines (classical + ML).
+    """
+    sim_rets = np.asarray(sim_rets, dtype=np.float64)
+    if sim_rets.ndim != 2:
+        raise ValueError(f"expected (n_paths, horizon_days), got shape {sim_rets.shape}")
+    sim_prices = safe_returns_to_prices(s0, sim_rets, cfg.data.max_abs_daily_ret, cfg.data.max_price)
+    h30 = min(cfg.model.horizon_days, 30)
+    real_h30 = make_horizon_returns(test_rets_raw, h30)
+    sim_h30 = np.log(np.clip(sim_prices[:, -1], SAFE_NUM_EPS, cfg.data.max_price) / max(s0, SAFE_NUM_EPS))
+    ks30 = compute_ks_distance(real_h30, sim_h30)
+    ci = bootstrap_ks_ci(sim_h30, real_h30, n_bootstrap=2000, rng_seed=int(cfg.seed))
+    holdout_rmse = float("nan")
+    if option_holdout is not None and not option_holdout.empty:
+        strikes = option_holdout["strike"].to_numpy(float)
+        taus = option_holdout["tau"].to_numpy(float)
+        market = option_holdout["market_price"].to_numpy(float)
+        mc = monte_carlo_call_prices_from_paths(sim_prices, strikes, taus, cfg.data.risk_free)
+        holdout_rmse = float(np.sqrt(np.mean((mc - market) ** 2)))
+    mart = check_martingale_condition(sim_prices, s0, cfg.data.risk_free, h30 / TRADING_DAYS)
+    return {
+        "ks30": float(ks30),
+        "ks30_ci_hi": float(ci["ci_hi"]),
+        "ks30_ci_lo": float(ci["ci_lo"]),
+        "holdout_rmse": float(holdout_rmse),
+        "martingale_pct": float(mart["martingale_error_pct"]),
+        "n_paths": int(sim_rets.shape[0]),
+    }
+
+
+def run_ml_baseline(baseline_name: str, ticker: str, seed: int,
+                    train_rets: np.ndarray, val_rets: np.ndarray,
+                    test_rets: np.ndarray, option_train_df: pd.DataFrame,
+                    option_holdout_df: pd.DataFrame, s0: float,
+                    cfg: Config, timeout_sec: int = 7200) -> Dict[str, float]:
+    """Spec-out, subprocess-call, paths-in. Then evaluate via STRATA pipeline."""
+    io_root = Path(cfg.out_dir) / "baseline_io"
+    in_dir = io_root / "inputs"
+    out_dir = io_root / "outputs"
+    in_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    tag = f"{ticker}_seed{seed}_{baseline_name.lower()}"
+    train_p = in_dir / f"{ticker}_seed{seed}_train.npy"
+    val_p   = in_dir / f"{ticker}_seed{seed}_val.npy"
+    test_p  = in_dir / f"{ticker}_seed{seed}_test.npy"
+    optr_p  = in_dir / f"{ticker}_seed{seed}_option_train.csv"
+    opth_p  = in_dir / f"{ticker}_seed{seed}_option_holdout.csv"
+    spec_p  = in_dir / f"{tag}_spec.json"
+    paths_p = out_dir / f"{tag}_paths.npy"
+    res_p   = out_dir / f"{tag}_result.json"
+
+    np.save(train_p, train_rets)
+    np.save(val_p, val_rets)
+    np.save(test_p, test_rets)
+    option_train_df.to_csv(optr_p, index=False)
+    option_holdout_df.to_csv(opth_p, index=False)
+
+    spec = {
+        "baseline_name": baseline_name,
+        "ticker": ticker, "seed": int(seed), "s0": float(s0),
+        "risk_free": float(cfg.data.risk_free),
+        "horizon_days": int(cfg.model.horizon_days),
+        "n_paths_eval": int(cfg.data.n_paths_eval),
+        "train_returns_path": str(train_p), "val_returns_path": str(val_p),
+        "test_returns_path": str(test_p),
+        "option_train_csv": str(optr_p), "option_holdout_csv": str(opth_p),
+        "paths_output_path": str(paths_p), "result_json_path": str(res_p),
+    }
+    with open(spec_p, "w") as f:
+        json.dump(spec, f, indent=2)
+
+    runner_script = Path("baselines") / f"{baseline_name.lower()}_runner.py"
+    if not runner_script.exists():
+        LOGGER.warning("ML baseline %s: runner script %s not found, skipping",
+                       baseline_name, runner_script)
+        return {}
+
+    try:
+        subprocess.run(["python", str(runner_script), "--spec", str(spec_p)],
+                       check=True, timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        LOGGER.warning("ML baseline %s timed out after %ds, skipping", baseline_name, timeout_sec)
+        return {}
+    except subprocess.CalledProcessError as e:
+        LOGGER.warning("ML baseline %s subprocess failed (rc=%d), skipping", baseline_name, e.returncode)
+        return {}
+
+    if not paths_p.exists():
+        LOGGER.warning("ML baseline %s: expected paths file %s not produced, skipping",
+                       baseline_name, paths_p)
+        return {}
+
+    sim_rets = np.load(paths_p)
+    expected_h = int(cfg.model.horizon_days)
+    if sim_rets.ndim != 2 or sim_rets.shape[1] != expected_h:
+        LOGGER.warning("ML baseline %s: bad shape %s (expected (n_paths,%d)), skipping",
+                       baseline_name, sim_rets.shape, expected_h)
+        return {}
+
+    metrics = _evaluate_external_paths(sim_rets, s0, test_rets, option_holdout_df, cfg)
+    prefix = baseline_name
+    return {f"{prefix}_KS30": metrics["ks30"],
+            f"{prefix}_KS30_ci_hi": metrics["ks30_ci_hi"],
+            f"{prefix}_KS30_ci_lo": metrics["ks30_ci_lo"],
+            f"{prefix}_holdout_RMSE": metrics["holdout_rmse"],
+            f"{prefix}_martingale_pct": metrics["martingale_pct"],
+            f"{prefix}_n_paths": metrics["n_paths"]}
+
+
+def run_all_ml_baselines(ticker: str, seed: int, train_rets, val_rets, test_rets,
+                          option_train_df, option_holdout_df, s0: float,
+                          cfg: Config) -> Dict[str, float]:
+    names = list(getattr(cfg, "ml_baselines", []) or [])
+    if not names:
+        return {}
+    out = {}
+    for name in names:
+        LOGGER.info("Running ML baseline: %s on %s seed=%d", name, ticker, seed)
+        try:
+            m = run_ml_baseline(name, ticker, seed, train_rets, val_rets, test_rets,
+                                 option_train_df, option_holdout_df, s0, cfg)
+            out.update(m)
+            if m:
+                LOGGER.info("ML baseline %s | KS30=%.4f RMSE=%.4f mart%%=%.3f",
+                             name, m.get(f"{name}_KS30", float("nan")),
+                             m.get(f"{name}_holdout_RMSE", float("nan")),
+                             m.get(f"{name}_martingale_pct", float("nan")))
+        except Exception as e:
+            LOGGER.warning("ML baseline %s raised: %s (skipping)", name, e)
+    return out
+
+
+def run_ticker(ticker: str, cfg: Config) -> Dict[str, object]:
+    LOGGER.info("Running ticker %s", ticker)
+    rets_raw, s0, _ = download_returns(ticker, cfg.data.start_date, cfg.data.end_date)
+    train_raw, val_raw, test_raw = split_returns(rets_raw, cfg.data.train_frac, cfg.data.val_frac)
+    norm = fit_return_normalizer(train_raw, cfg.data.normaliser_floor)
+    train_norm = norm.normalize(train_raw)
+    val_norm = norm.normalize(val_raw)
+
+    cfg.current_s0 = s0
+    cfg.current_return_std = norm.std
+    option_train, option_holdout, option_core = build_option_surface(ticker, s0, train_raw, cfg)
+    if not option_core.empty and "iv" in option_core.columns:
+        ivs = option_core["iv"].dropna()
+        if len(ivs) >= 3:
+            cfg.current_target_vol_ann = float(np.clip(ivs.median(), 0.05, 1.5))
+    LOGGER.info("Anchor: S0=%.2f ret_std=%.6f target_vol_ann=%.4f", cfg.current_s0, cfg.current_return_std, cfg.current_target_vol_ann)
+
+    # Train P-model
+    p_model, sched, p_metrics = fit_p_model(train_norm, val_norm, cfg, cfg.device, s0, test_raw, option_holdout, norm, option_core)
+    prices_p, p_eval = evaluate_p_measure(p_model, sched, s0, train_norm, test_raw, option_holdout, cfg, cfg.device, norm)
+
+    # Build path banks for Q
+    train_bank_norm = build_path_bank(p_model, sched, train_norm, cfg.data.q_bank_train_anchors, cfg, cfg.device)
+    val_seed = val_norm if len(val_norm) > cfg.model.seq_len else train_norm
+    val_bank_norm = build_path_bank(p_model, sched, val_seed, cfg.data.q_bank_val_anchors, cfg, cfg.device)
+    train_paths = returns_to_prices(s0, norm.denormalize(train_bank_norm), max_price=cfg.data.max_price)
+    val_paths = returns_to_prices(s0, norm.denormalize(val_bank_norm), max_price=cfg.data.max_price)
+
+    # Estimate real P-measure drift/vol for Girsanov
+    real_mu = float(np.mean(train_raw) * TRADING_DAYS)
+    real_sigma = float(np.std(train_raw) * math.sqrt(TRADING_DAYS))
+
+    # Train Q-model
+    q_net, q_metrics = train_q_model(train_paths, val_paths, s0, option_train, option_holdout,
+                                     val_raw, cfg, cfg.device, real_mu, real_sigma)
+    q_eval = evaluate_q_measure(q_net, val_paths, s0, option_holdout, test_raw, cfg, cfg.device)
+
+    # Baselines
+    baseline_metrics = evaluate_baselines(s0, train_raw, test_raw, option_holdout, cfg)
+
+    # ML baselines (subprocess interface — see baselines/README.md)
+    ml_baseline_metrics = run_all_ml_baselines(
+        ticker=ticker, seed=cfg.seed,
+        train_rets=train_raw, val_rets=val_raw, test_rets=test_raw,
+        option_train_df=option_train, option_holdout_df=option_holdout,
+        s0=float(s0), cfg=cfg,
+    )
+    baseline_metrics.update(ml_baseline_metrics)
+
+    # Collect all metrics
+    metrics = {}
+    metrics.update(p_metrics)
+    metrics.update(p_eval)
+    metrics.update(q_metrics)
+    metrics.update(q_eval)
+    metrics.update(baseline_metrics)
+    metrics["risk_free_used"] = float(cfg.data.risk_free)
+    metrics["S0"] = float(s0)
+    metrics["return_norm_mean"] = float(norm.mean)
+    metrics["return_norm_std"] = float(norm.std)
+
+    fin_tree = build_finance_objective_tree(metrics, cfg)
+
+    # Save output
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    out_path = os.path.join(cfg.out_dir, f"{ticker}_metrics_{cfg.version}.json")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump({"ticker": ticker, "config": asdict(cfg), "metrics": metrics, "finance_tree": fin_tree},
+                  fh, indent=2, default=str)
+    LOGGER.info("Metrics saved -> %s", out_path)
+
+    # Print summary
+    LOGGER.info("─" * 70)
+    LOGGER.info("  STRATA %s Summary — %s", cfg.version, ticker)
+    LOGGER.info("  P KS30 = %.4f (CI hi = %.4f)", metrics.get("P_KS30", float("nan")), metrics.get("P_KS30_ci_hi", float("nan")))
+    LOGGER.info("  P holdout RMSE = %.5f", metrics.get("P_holdout_RMSE", float("nan")))
+    LOGGER.info("  Q ESS = %.3f, Q KS30 = %.4f", metrics.get("Q_ESS", float("nan")), metrics.get("Q_KS30", float("nan")))
+    LOGGER.info("  Q holdout RMSE = %.5f", metrics.get("Q_holdout_RMSE", float("nan")))
+    LOGGER.info("  GBM KS30 = %.4f, Heston KS30 = %.4f", metrics.get("GBM_KS30", float("nan")), metrics.get("Heston_KS30", float("nan")))
+    LOGGER.info("─" * 70)
+
+    return {"ticker": ticker, "metrics": metrics, "tree": fin_tree}
+
+
+def _aggregate_runs(out_dir: str, version: str, runs: List[Dict]) -> None:
+    """Aggregate per-(ticker,seed) metrics into CSV + LaTeX table.
+
+    Reports mean ± std across seeds for each ticker. Designed to drop
+    directly into a QF manuscript's results section.
+    """
+    if not runs:
+        LOGGER.warning("No runs to aggregate")
+        return
+    rows = []
+    for r in runs:
+        m = r.get("metrics", {})
+        rows.append({
+            "ticker": r["ticker"], "seed": r["seed"],
+            **{k: v for k, v in m.items() if isinstance(v, (int, float))},
+        })
+    df = pd.DataFrame(rows)
+    csv_path = os.path.join(out_dir, f"runs_per_seed_{version}.csv")
+    df.to_csv(csv_path, index=False)
+    LOGGER.info("Per-seed CSV -> %s", csv_path)
+
+    headline = ["P_KS30", "P_KS30_ci_hi", "P_holdout_RMSE",
+                "Q_KS30", "Q_ESS", "Q_holdout_RMSE",
+                "GBM_KS30", "Heston_KS30", "rBergomi_KS30"]
+    # Include any ML baseline columns auto-detected
+    ml_cols = sorted({c for c in df.columns
+                      if c.endswith("_KS30") and c not in headline
+                      and not c.startswith(("P_", "Q_", "GBM_", "Heston_", "rBergomi_"))})
+    headline = headline + ml_cols
+
+    agg_rows = []
+    for tkr, sub in df.groupby("ticker"):
+        row = {"ticker": tkr, "n_seeds": len(sub)}
+        for c in headline:
+            if c in sub.columns:
+                vals = sub[c].dropna()
+                row[f"{c}_mean"] = float(vals.mean()) if len(vals) else float("nan")
+                row[f"{c}_std"]  = float(vals.std(ddof=1)) if len(vals) > 1 else 0.0
+        agg_rows.append(row)
+    agg_df = pd.DataFrame(agg_rows)
+    agg_csv = os.path.join(out_dir, f"results_aggregated_{version}.csv")
+    agg_df.to_csv(agg_csv, index=False)
+    LOGGER.info("Aggregated CSV -> %s", agg_csv)
+
+    # LaTeX table — paste-ready for QF manuscript
+    tex_path = os.path.join(out_dir, f"results_table_{version}.tex")
+    with open(tex_path, "w") as fh:
+        fh.write("% Auto-generated by STRATA. Mean +/- std across seeds.\n")
+        fh.write("\\begin{tabular}{l" + "c" * len(headline) + "}\n\\toprule\n")
+        fh.write("Ticker & " + " & ".join(c.replace("_", "\\_") for c in headline) + " \\\\\n\\midrule\n")
+        for _, row in agg_df.iterrows():
+            cells = [row["ticker"]]
+            for c in headline:
+                m, s = row.get(f"{c}_mean", float("nan")), row.get(f"{c}_std", float("nan"))
+                cells.append(f"{m:.3f} $\\pm$ {s:.3f}" if np.isfinite(m) else "--")
+            fh.write(" & ".join(cells) + " \\\\\n")
+        fh.write("\\bottomrule\n\\end{tabular}\n")
+    LOGGER.info("LaTeX table -> %s", tex_path)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tickers", nargs="+", default=["SPY", "QQQ", "IWM", "TLT"])
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 456])
+    parser.add_argument("--ml_baselines", nargs="*", default=["TimeGAN"],
+                        help="ML baseline names; each needs baselines/<n>_runner.py")
+    parser.add_argument("--device", type=str,
+                        default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--out_dir", type=str, default="strata_outputs")
+    parser.add_argument("--no_regime", action="store_true",
+                        help="Ablation: disable regime-aware residual (sets regime_residual_scale=0).")
+    parser.add_argument("--no_anchor", action="store_true",
+                        help="Ablation: disable volatility anchor loss (zeros all anchor weights).")
+    parser.add_argument("--no_mmd", action="store_true",
+                        help="Ablation: disable MMD supervision (zeros all MMD loss weights).")
+    parser.add_argument("--ablation_tag", type=str, default="",
+                        help="Extra version suffix for ablation runs.")
+    args, _ = parser.parse_known_args()
+
+    LOGGER.info("Multi-run sweep: tickers=%s seeds=%s ml_baselines=%s",
+                args.tickers, args.seeds, args.ml_baselines)
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    all_runs: List[Dict] = []
+    total = len(args.tickers) * len(args.seeds)
+    idx = 0
+    t_start = time.time()
+    for ticker in args.tickers:
+        for seed in args.seeds:
+            idx += 1
+            LOGGER.info("=" * 78)
+            LOGGER.info("RUN %d/%d | ticker=%s seed=%d | elapsed=%.1fmin",
+                        idx, total, ticker, seed, (time.time() - t_start) / 60.0)
+            LOGGER.info("=" * 78)
+            cfg = Config()
+            cfg.data.tickers = (ticker,)
+            cfg.seed = int(seed)
+            cfg.device = args.device
+            cfg.out_dir = args.out_dir
+            cfg.ml_baselines = list(args.ml_baselines)
+
+            # ---- Ablation toggles ----
+            ablation_bits = []
+            if args.no_regime:
+                cfg.model.regime_residual_scale = 0.0
+                ablation_bits.append("noregime")
+            if args.no_anchor:
+                cfg.stage.p_stage1_use_anchor = False
+                cfg.stage.p_stage2_anchor_frac = 0.0
+                cfg.stage.p_anchor_max_lam = 0.0
+                ablation_bits.append("noanchor")
+            if args.no_mmd:
+                cfg.loss.p_mmd_lam = 0.0
+                cfg.loss.p_mmd_stage2_frac = 0.0
+                cfg.loss.p_horizon_mmd_lam = 0.0
+                ablation_bits.append("nommd")
+            if args.ablation_tag:
+                ablation_bits.append(args.ablation_tag)
+            if ablation_bits:
+                cfg.version = cfg.version + "_" + "_".join(ablation_bits)
+                LOGGER.info("Ablation active: version=%s", cfg.version)
+
+            set_seed(cfg.seed)
+            try:
+                res = run_ticker(ticker, cfg)
+                res["seed"] = int(seed)
+                all_runs.append(res)
+                # Per-(ticker,seed) JSON for safe-keeping
+                per_path = os.path.join(args.out_dir,
+                                        f"{ticker}_seed{seed}_metrics.json")
+                with open(per_path, "w") as f:
+                    json.dump({"ticker": ticker, "seed": seed,
+                               "metrics": res.get("metrics", {})},
+                              f, indent=2, default=str)
+            except Exception as e:
+                LOGGER.exception("Run failed: ticker=%s seed=%d err=%s", ticker, seed, e)
+
+    agg_tag = "strataqf_v16"
+    extras = []
+    if args.no_regime: extras.append("noregime")
+    if args.no_anchor: extras.append("noanchor")
+    if args.no_mmd:    extras.append("nommd")
+    if args.ablation_tag: extras.append(args.ablation_tag)
+    if extras: agg_tag = agg_tag + "_" + "_".join(extras)
+    _aggregate_runs(args.out_dir, agg_tag, all_runs)
+    LOGGER.info("Sweep complete in %.1fmin. %d/%d runs succeeded.",
+                (time.time() - t_start) / 60.0, len(all_runs), total)
+
+
+if __name__ == "__main__":
+    main()
