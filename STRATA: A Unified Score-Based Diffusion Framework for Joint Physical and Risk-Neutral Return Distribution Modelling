@@ -1,11 +1,4 @@
 # STRATA — Structured Regime-Aware Transition Adaptive Diffusion
-# =================================================================
-# Publication version v16 — Corrected, complete, and evidence‑rich.
-# Merges algorithmic correctness with comprehensive evaluation and reporting.
-# Ready for Quantitative Finance submission.
-# =================================================================
-
-from __future__ import annotations
 
 import argparse
 import gc
